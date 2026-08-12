@@ -1,17 +1,31 @@
 import { createClient } from '@/lib/supabase/server'
-
+import { redirect } from 'next/navigation'
+// Logout Server Action
+async function logout() {
+  'use server'
+  const supabase = await createClient()
+  await supabase.auth.signOut()
+  redirect('/login')
+}
 export default async function Home() {
   const supabase = await createClient()
-  const { data: documentos, error } = await supabase
-    .from('documentos')
-    .select('id, titulo, cliente, fecha_limite, estado, responsables(nombre)')
-    .order('fecha_limite', { ascending: true })
+  const { data: documents, error } = await supabase
+    .from('documents')
+    .select('id, title, client, due_date, status, assignees(name)')
+    .order('due_date', { ascending: true })
 
   if (error) return <p className="p-8 text-red-500">Error: {error.message}</p>
 
   return (
     <main className="max-w-3xl mx-auto p-8">
-      <h1 className="text-2xl font-bold mb-4">書類管理 / Document management</h1>
+      <div className="flex items-center justify-between mb-4">
+        <h1 className="text-2xl font-bold">書類管理 / Document management</h1>
+        <form action={logout}>
+          <button className="text-sm text-gray-600 underline">
+            Cerrar sesión
+          </button>
+        </form>
+      </div>
       <table className="w-full border-collapse">
         <thead>
           <tr className="border-b text-left">
@@ -20,13 +34,13 @@ export default async function Home() {
           </tr>
         </thead>
         <tbody>
-          {documentos?.map((d) => (
+          {documents?.map((d) => (
             <tr key={d.id} className="border-b">
-              <td className="py-2">{d.titulo}</td>
-              <td>{d.cliente}</td>
-              <td>{d.fecha_limite}</td>
-              <td>{d.responsables?.nombre}</td>
-              <td>{d.estado}</td>
+              <td className="py-2">{d.title}</td>
+              <td>{d.client}</td>
+              <td>{d.due_date}</td>
+              <td>{d.assignees?.name}</td>
+              <td>{d.status}</td>
             </tr>
           ))}
         </tbody>

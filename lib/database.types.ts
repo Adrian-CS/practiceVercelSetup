@@ -14,61 +14,61 @@ export type Database = {
   }
   public: {
     Tables: {
-      documentos: {
-        Row: {
-          cliente: string | null
-          created_at: string | null
-          estado: string
-          fecha_limite: string
-          id: number
-          responsable_id: number | null
-          titulo: string
-        }
-        Insert: {
-          cliente?: string | null
-          created_at?: string | null
-          estado?: string
-          fecha_limite: string
-          id?: never
-          responsable_id?: number | null
-          titulo: string
-        }
-        Update: {
-          cliente?: string | null
-          created_at?: string | null
-          estado?: string
-          fecha_limite?: string
-          id?: never
-          responsable_id?: number | null
-          titulo?: string
-        }
-        Relationships: [
-          {
-            foreignKeyName: "documentos_responsable_id_fkey"
-            columns: ["responsable_id"]
-            isOneToOne: false
-            referencedRelation: "responsables"
-            referencedColumns: ["id"]
-          },
-        ]
-      }
-      responsables: {
+      assignees: {
         Row: {
           email: string | null
           id: number
-          nombre: string
+          name: string
         }
         Insert: {
           email?: string | null
           id?: never
-          nombre: string
+          name: string
         }
         Update: {
           email?: string | null
           id?: never
-          nombre?: string
+          name?: string
         }
         Relationships: []
+      }
+      documents: {
+        Row: {
+          assignee_id: number | null
+          client: string | null
+          created_at: string | null
+          due_date: string
+          id: number
+          status: string
+          title: string
+        }
+        Insert: {
+          assignee_id?: number | null
+          client?: string | null
+          created_at?: string | null
+          due_date: string
+          id?: never
+          status?: string
+          title: string
+        }
+        Update: {
+          assignee_id?: number | null
+          client?: string | null
+          created_at?: string | null
+          due_date?: string
+          id?: never
+          status?: string
+          title?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "documents_assignee_id_fkey"
+            columns: ["assignee_id"]
+            isOneToOne: false
+            referencedRelation: "assignees"
+            referencedColumns: ["id"]
+          },
+        ]
       }
     }
     Views: {
