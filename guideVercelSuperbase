@@ -693,6 +693,68 @@ Each skeleton is sized to match its real page (same max-width, same number of ro
 
 > Note: this only smooths *route-to-route* navigation (clicking a `<Link>` between `/`, `/new`, `/documents/[id]/edit`). The live search in Step 16 already handles its own in-place loading via `Filters`' `isPending` + "Searching…" indicator, wrapped in `useTransition` specifically so it *doesn't* re-trigger this route-level fallback on every keystroke.
 
+## Step 18 — Sortable columns and double-click-to-edit
+
+**a) Sortable headers — no JS needed.** Like pagination, "sort by this column" is just a link to a different URL; clicking a header navigates to `/?sort=title&dir=asc`. `sort`/`dir` join `q`/`status`/`page` as URL state, so the current view stays bookmarkable:
+```ts
+const SORT_COLUMNS = {
+  title: { column: 'title' },
+  client: { column: 'client' },
+  due_date: { column: 'due_date' },
+  status: { column: 'status' },
+  assignee: { column: 'name', referencedTable: 'assignees' },
+} as const
+
+type SortKey = keyof typeof SORT_COLUMNS
+
+const sortConfig = SORT_COLUMNS[sort]
+query = query.order(sortConfig.column, {
+  ascending: dir === 'asc',
+  referencedTable: 'referencedTable' in sortConfig ? sortConfig.referencedTable : undefined,
+})
+```
+Sorting by `assignee` orders by a column on the *joined* `assignees` table, not `documents` itself — supabase-js's `.order()` takes a `referencedTable` option for exactly this (verified against the real API first: `?order=assignees(name).asc` → `200`). `foreignTable` is the same option under its old, deprecated name.
+
+Each header is a small module-level component — not one declared inside `Home`, which would recreate it (and lose its identity) on every render:
+```tsx
+function SortHeader({ sortKey, label, sort, dir, q, status }: { sortKey: SortKey; label: string; sort: SortKey; dir: 'asc' | 'desc'; q: string; status: string }) {
+  const nextDir = sort === sortKey && dir === 'asc' ? 'desc' : 'asc'
+  const isActive = sort === sortKey
+  return (
+    <Link href={buildHref({ q, status, sort: sortKey, dir: nextDir, page: 1 })} className="inline-flex items-center gap-1">
+      {label}
+      {isActive && <span aria-hidden>{dir === 'asc' ? '▲' : '▼'}</span>}
+    </Link>
+  )
+}
+```
+Clicking an inactive column sorts it ascending; clicking the already-active one flips direction. Changing the sort resets to page 1, same as changing a filter.
+
+**b) Double-click a row to edit it — the one part that needs a Client Component.** `dblclick` is a browser event; there's no link/form equivalent. A thin wrapper around `<tr>` is enough — everything else about the row (the cells, the Edit link, the Delete form) stays exactly as it was:
+```tsx
+// app/DocumentRow.tsx
+'use client'
+import { useRouter } from 'next/navigation'
+
+export function DocumentRow({ href, className, children }: { href: string; className?: string; children: React.ReactNode }) {
+  const router = useRouter()
+  return (
+    <tr
+      className={className}
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement).closest('a, button')) return
+        router.push(href)
+      }}
+    >
+      {children}
+    </tr>
+  )
+}
+```
+The `closest('a, button')` guard matters: without it, double-clicking the row's own **Edit** link or **Delete** button would *also* fire the row's navigation — harmless for Edit (same destination), but worth avoiding for Delete, where a stray navigation racing the `confirm()` dialog is just needless complexity.
+
+> Same pattern as Step 16: reach for a Client Component only for the one interaction that's inherently a browser event (`dblclick`, keystrokes) — sorting and pagination stay server-rendered links.
+
 ---
 
 **Summary:** Supabase = ready-made backend (DB + API + auth); Vercel = global front end + test→prod flow on git. You only write pages and queries. That's why it's the fastest and cheapest option compared to running a VM.

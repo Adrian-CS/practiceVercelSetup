@@ -1,36 +1,94 @@
 import { createClient } from '@/lib/supabase/server'
 import { deleteDocument, logout } from './actions'
 import { DeleteButton } from './DeleteButton'
+import { DocumentRow } from './DocumentRow'
 import { Filters } from './Filters'
 import Link from 'next/link'
 import { buttonPrimaryClass, buttonSecondaryClass, linkClass, StatusBadge } from '@/lib/ui'
 
 const PAGE_SIZE = 10
 
-// Builds a `/?q=...&status=...&page=N` href, dropping empty params and the
-// page number when it's 1, so links stay clean and bookmarkable.
-function pageHref(params: { q: string; status: string; page: number }) {
+// Maps the public `sort` URL param to the actual column (and, for
+// `assignee`, the joined table) supabase-js needs to order by.
+const SORT_COLUMNS = {
+  title: { column: 'title' },
+  client: { column: 'client' },
+  due_date: { column: 'due_date' },
+  status: { column: 'status' },
+  assignee: { column: 'name', referencedTable: 'assignees' },
+} as const
+
+type SortKey = keyof typeof SORT_COLUMNS
+const DEFAULT_SORT: SortKey = 'due_date'
+
+function isSortKey(value: string): value is SortKey {
+  return value in SORT_COLUMNS
+}
+
+// Builds a `/?q=...&status=...&sort=...&dir=...&page=N` href, dropping
+// params that are already the default so URLs stay clean and bookmarkable.
+function buildHref(params: { q: string; status: string; sort: SortKey; dir: 'asc' | 'desc'; page: number }) {
   const sp = new URLSearchParams()
   if (params.q) sp.set('q', params.q)
   if (params.status) sp.set('status', params.status)
+  if (params.sort !== DEFAULT_SORT) sp.set('sort', params.sort)
+  if (params.dir !== 'asc') sp.set('dir', params.dir)
   if (params.page > 1) sp.set('page', String(params.page))
   const qs = sp.toString()
   return qs ? `/?${qs}` : '/'
 }
 
+// A sortable header: a link that sorts ascending by `sortKey`, or flips
+// direction if `sortKey` is already the active sort column. Defined at
+// module scope (not inside Home) — components created during render lose
+// their identity every re-render.
+function SortHeader({
+  sortKey,
+  label,
+  sort,
+  dir,
+  q,
+  status,
+}: {
+  sortKey: SortKey
+  label: string
+  sort: SortKey
+  dir: 'asc' | 'desc'
+  q: string
+  status: string
+}) {
+  const nextDir: 'asc' | 'desc' = sort === sortKey && dir === 'asc' ? 'desc' : 'asc'
+  const isActive = sort === sortKey
+  return (
+    <Link
+      href={buildHref({ q, status, sort: sortKey, dir: nextDir, page: 1 })}
+      className={`inline-flex items-center gap-1 hover:text-gray-900 dark:hover:text-gray-100 ${isActive ? 'text-gray-900 dark:text-gray-100' : ''}`}
+    >
+      {label}
+      {isActive && <span aria-hidden>{dir === 'asc' ? '▲' : '▼'}</span>}
+    </Link>
+  )
+}
+
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ q?: string; status?: string; page?: string }>
+  searchParams: Promise<{ q?: string; status?: string; sort?: string; dir?: string; page?: string }>
 }) {
-  const { q = '', status = '', page: pageParam } = await searchParams
+  const { q = '', status = '', sort: sortParam, dir: dirParam, page: pageParam } = await searchParams
+  const sort: SortKey = sortParam && isSortKey(sortParam) ? sortParam : DEFAULT_SORT
+  const dir: 'asc' | 'desc' = dirParam === 'desc' ? 'desc' : 'asc'
   const page = Math.max(1, Number(pageParam) || 1)
 
   const supabase = await createClient()
+  const sortConfig = SORT_COLUMNS[sort]
   let query = supabase
     .from('documents')
     .select('id, title, client, due_date, status, assignees(name)', { count: 'exact' })
-    .order('due_date', { ascending: true })
+    .order(sortConfig.column, {
+      ascending: dir === 'asc',
+      referencedTable: 'referencedTable' in sortConfig ? sortConfig.referencedTable : undefined,
+    })
 
   // Strip characters that have special meaning in PostgREST's `or()` filter
   // syntax (commas separate conditions, parens group them) so a search term
@@ -84,17 +142,31 @@ export default async function Home({
         <table className="w-full border-collapse text-sm">
           <thead className="bg-gray-50 text-left text-xs uppercase tracking-wide text-gray-500 dark:bg-gray-900 dark:text-gray-400">
             <tr>
-              <th className="px-4 py-3">Title</th>
-              <th className="hidden px-4 py-3 sm:table-cell">Client</th>
-              <th className="px-4 py-3">Due date</th>
-              <th className="hidden px-4 py-3 md:table-cell">Assignee</th>
-              <th className="px-4 py-3">Status</th>
+              <th className="px-4 py-3">
+                <SortHeader sortKey="title" label="Title" sort={sort} dir={dir} q={q} status={status} />
+              </th>
+              <th className="hidden px-4 py-3 sm:table-cell">
+                <SortHeader sortKey="client" label="Client" sort={sort} dir={dir} q={q} status={status} />
+              </th>
+              <th className="px-4 py-3">
+                <SortHeader sortKey="due_date" label="Due date" sort={sort} dir={dir} q={q} status={status} />
+              </th>
+              <th className="hidden px-4 py-3 md:table-cell">
+                <SortHeader sortKey="assignee" label="Assignee" sort={sort} dir={dir} q={q} status={status} />
+              </th>
+              <th className="px-4 py-3">
+                <SortHeader sortKey="status" label="Status" sort={sort} dir={dir} q={q} status={status} />
+              </th>
               <th className="px-4 py-3" />
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-800">
             {documents?.map((d) => (
-              <tr key={d.id} className="hover:bg-gray-50 dark:hover:bg-gray-900/50">
+              <DocumentRow
+                key={d.id}
+                href={`/documents/${d.id}/edit`}
+                className="cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-900/50"
+              >
                 <td className="px-4 py-3 font-medium">{d.title}</td>
                 <td className="hidden px-4 py-3 text-gray-600 sm:table-cell dark:text-gray-400">
                   {d.client}
@@ -113,7 +185,7 @@ export default async function Home({
                     </form>
                   </div>
                 </td>
-              </tr>
+              </DocumentRow>
             ))}
             {documents?.length === 0 && (
               <tr>
@@ -134,7 +206,7 @@ export default async function Home({
         </p>
         <div className="flex items-center gap-2">
           {page > 1 ? (
-            <Link href={pageHref({ q, status, page: page - 1 })} className={buttonSecondaryClass}>
+            <Link href={buildHref({ q, status, sort, dir, page: page - 1 })} className={buttonSecondaryClass}>
               Previous
             </Link>
           ) : (
@@ -142,7 +214,7 @@ export default async function Home({
           )}
           <span className="px-2">Page {page} of {totalPages}</span>
           {page < totalPages ? (
-            <Link href={pageHref({ q, status, page: page + 1 })} className={buttonSecondaryClass}>
+            <Link href={buildHref({ q, status, sort, dir, page: page + 1 })} className={buttonSecondaryClass}>
               Next
             </Link>
           ) : (

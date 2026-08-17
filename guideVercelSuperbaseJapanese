@@ -693,6 +693,68 @@ export default function Loading() {
 
 > 補足:これが滑らかにするのは *ルート間の* ナビゲーション(`/`・`/new`・`/documents/[id]/edit` 間の `<Link>` クリック)だけ。ステップ16 のリアルタイム検索は、`Filters` の `isPending` + 「Searching…」表示という自前のその場ローディングを既に持っており、`useTransition` で包んでいるのはまさに、1文字入力するたびにこのルートレベルの fallback が出ないようにするため。
 
+## ステップ18 — 列ヘッダーでのソートと、行のダブルクリックで編集
+
+**a) ソート可能なヘッダー — JS 不要。** ページネーションと同じで、「この列でソート」は別の URL へのリンクにすぎない。ヘッダーをクリックすると `/?sort=title&dir=asc` へ遷移する。`sort`/`dir` は `q`/`status`/`page` と同じく URL の状態として持たせるので、今見ている表示状態はそのままブックマークできる:
+```ts
+const SORT_COLUMNS = {
+  title: { column: 'title' },
+  client: { column: 'client' },
+  due_date: { column: 'due_date' },
+  status: { column: 'status' },
+  assignee: { column: 'name', referencedTable: 'assignees' },
+} as const
+
+type SortKey = keyof typeof SORT_COLUMNS
+
+const sortConfig = SORT_COLUMNS[sort]
+query = query.order(sortConfig.column, {
+  ascending: dir === 'asc',
+  referencedTable: 'referencedTable' in sortConfig ? sortConfig.referencedTable : undefined,
+})
+```
+`assignee` でソートするというのは、`documents` 自体ではなく *結合先* の `assignees` テーブルの列で並べ替えるということ。supabase-js の `.order()` にはまさにこのための `referencedTable` オプションがある(実装前に本物の API で確認済み:`?order=assignees(name).asc` → `200`)。`foreignTable` は同じオプションの旧称(非推奨)。
+
+各ヘッダーはモジュールスコープの小さなコンポーネント — `Home` の中で宣言すると、レンダーのたびに作り直されて(同一性を失って)しまうので、外に出してある:
+```tsx
+function SortHeader({ sortKey, label, sort, dir, q, status }: { sortKey: SortKey; label: string; sort: SortKey; dir: 'asc' | 'desc'; q: string; status: string }) {
+  const nextDir = sort === sortKey && dir === 'asc' ? 'desc' : 'asc'
+  const isActive = sort === sortKey
+  return (
+    <Link href={buildHref({ q, status, sort: sortKey, dir: nextDir, page: 1 })} className="inline-flex items-center gap-1">
+      {label}
+      {isActive && <span aria-hidden>{dir === 'asc' ? '▲' : '▼'}</span>}
+    </Link>
+  )
+}
+```
+非アクティブな列をクリックすると昇順でソートし、既にアクティブな列をクリックすると向きが反転する。ソートを変えるとページ1に戻る点はフィルターを変えたときと同じ。
+
+**b) 行をダブルクリックして編集 — クライアントコンポーネントが要る唯一の部分。** `dblclick` はブラウザのイベントであり、リンクやフォームに相当するものが無い。`<tr>` を薄くラップするだけで十分 — 行の中身(セル、Edit リンク、Delete フォーム)は今までどおり:
+```tsx
+// app/DocumentRow.tsx
+'use client'
+import { useRouter } from 'next/navigation'
+
+export function DocumentRow({ href, className, children }: { href: string; className?: string; children: React.ReactNode }) {
+  const router = useRouter()
+  return (
+    <tr
+      className={className}
+      onDoubleClick={(e) => {
+        if ((e.target as HTMLElement).closest('a, button')) return
+        router.push(href)
+      }}
+    >
+      {children}
+    </tr>
+  )
+}
+```
+`closest('a, button')` によるガードが重要:これが無いと、行の中にある **Edit** リンクや **Delete** ボタンをダブルクリックしたときにも行の遷移が発火してしまう — Edit なら行き先が同じなので実害は無いが、Delete の場合は `confirm()` ダイアログと余計なナビゲーションが競合する可能性があり、避けておく価値がある。
+
+> ステップ16 と同じパターン:クライアントコンポーネントに頼るのは、`dblclick` やキー入力のように本質的にブラウザのイベントである部分だけ — ソートやページネーションはサーバーレンダリングのリンクのまま。
+
 ---
 
 **まとめ:** Supabase = 出来合いのバックエンド(DB + API + 認証)、Vercel = グローバルなフロント + git ベースのテスト→本番フロー。自分はページとクエリを書くだけ。VM を自前で運用する方式に比べ、最速・最安である理由がこれ。
