@@ -2,7 +2,7 @@ import { createClient } from '@/lib/supabase/server'
 import { updateDocument } from '@/app/actions'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
-import { buttonPrimaryClass, inputClass, labelClass, linkClass } from '@/lib/ui'
+import { buttonPrimaryClass, inputClass, labelClass, linkClass, STATUSES } from '@/lib/ui'
 
 export default async function EditDocument({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -43,9 +43,9 @@ export default async function EditDocument({ params }: { params: Promise<{ id: s
         <div>
           <label htmlFor="status" className={labelClass}>Status</label>
           <select id="status" name="status" defaultValue={doc.status} className={inputClass}>
-            <option value="pending">pending</option>
-            <option value="in_progress">in_progress</option>
-            <option value="completed">completed</option>
+            {STATUSES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
           </select>
         </div>
         <div>

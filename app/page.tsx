@@ -1,17 +1,11 @@
 import { createClient } from '@/lib/supabase/server'
 import { deleteDocument, logout } from './actions'
+import { DeleteButton } from './DeleteButton'
+import { Filters } from './Filters'
 import Link from 'next/link'
-import {
-  buttonPrimaryClass,
-  buttonSecondaryClass,
-  inputClass,
-  labelClass,
-  linkClass,
-  StatusBadge,
-} from '@/lib/ui'
+import { buttonPrimaryClass, buttonSecondaryClass, linkClass, StatusBadge } from '@/lib/ui'
 
 const PAGE_SIZE = 10
-const STATUSES = ['pending', 'in_progress', 'completed'] as const
 
 // Builds a `/?q=...&status=...&page=N` href, dropping empty params and the
 // page number when it's 1, so links stay clean and bookmarkable.
@@ -42,7 +36,26 @@ export default async function Home({
   // syntax (commas separate conditions, parens group them) so a search term
   // like "Acme, Inc." can't break the query.
   const safeQ = q.replace(/[,()]/g, '').trim()
-  if (safeQ) query = query.or(`title.ilike.%${safeQ}%,client.ilike.%${safeQ}%`)
+  if (safeQ) {
+    const orParts = [
+      `title.ilike.%${safeQ}%`,
+      `client.ilike.%${safeQ}%`,
+      `status.ilike.%${safeQ}%`,
+    ]
+    // `assignees.name` lives on a joined table — PostgREST's `or()` can't
+    // filter an embedded resource's column directly, so look up matching
+    // assignees first and match documents by their id instead. (A cast like
+    // `due_date::text.ilike...` would cover the due date too, but PostgREST
+    // rejects `::` casts inside `or()`, so dates are left out of search.)
+    const { data: matchingAssignees } = await supabase
+      .from('assignees')
+      .select('id')
+      .ilike('name', `%${safeQ}%`)
+    if (matchingAssignees?.length) {
+      orParts.push(`assignee_id.in.(${matchingAssignees.map((a) => a.id).join(',')})`)
+    }
+    query = query.or(orParts.join(','))
+  }
   if (status) query = query.eq('status', status)
 
   const from = (page - 1) * PAGE_SIZE
@@ -63,31 +76,7 @@ export default async function Home({
         </div>
       </div>
 
-      <form action="/" className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
-        <div className="flex-1">
-          <label htmlFor="q" className={labelClass}>Search</label>
-          <input
-            id="q"
-            name="q"
-            defaultValue={q}
-            placeholder="Title or client…"
-            className={inputClass}
-          />
-        </div>
-        <div className="sm:w-48">
-          <label htmlFor="status" className={labelClass}>Status</label>
-          <select id="status" name="status" defaultValue={status} className={inputClass}>
-            <option value="">All statuses</option>
-            {STATUSES.map((s) => (
-              <option key={s} value={s}>{s.replace('_', ' ')}</option>
-            ))}
-          </select>
-        </div>
-        <div className="flex gap-2">
-          <button className={buttonPrimaryClass}>Filter</button>
-          {(q || status) && <Link href="/" className={buttonSecondaryClass}>Clear</Link>}
-        </div>
-      </form>
+      <Filters defaultQ={q} defaultStatus={status} />
 
       {error && <p className="mb-4 text-red-500">Error: {error.message}</p>}
 
@@ -120,9 +109,7 @@ export default async function Home({
                     <Link href={`/documents/${d.id}/edit`} className={linkClass}>Edit</Link>
                     <form action={deleteDocument}>
                       <input type="hidden" name="id" value={d.id} />
-                      <button className="text-red-600 hover:underline dark:text-red-400">
-                        Delete
-                      </button>
+                      <DeleteButton className="text-red-600 hover:underline dark:text-red-400" />
                     </form>
                   </div>
                 </td>

@@ -24,3 +24,10 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Native <button> defaults to cursor: default in most browsers (only <a>
+   gets a pointer automatically) — without this, buttons look unresponsive
+   on hover even though they work fine. */
+button:not(:disabled) {
+  cursor: pointer;
+}

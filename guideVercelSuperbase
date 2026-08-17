@@ -561,7 +561,105 @@ function pageHref({ q, status, page }: { q: string; status: string; page: number
 }
 ```
 
-> Why no Client Component: search, filter and paging are all expressible as a GET form and links — the same server-first approach as the rest of the app. No `useState`, no debounce, and it keeps working with JavaScript disabled. `q`/`status`/`page` living in the URL also makes the current view bookmarkable and shareable.
+> Why no Client Component (first pass): search, filter and paging were all expressible as a GET form and links — the same server-first approach as the rest of the app. No `useState`, no debounce, and it kept working with JavaScript disabled. `q`/`status`/`page` living in the URL also made the current view bookmarkable and shareable. Step 16 revisits this: live, as-you-type search needs a Client Component after all.
+
+## Step 16 — Delete confirmation, cursor feedback, and live search across all fields
+
+**a) Delete needs a confirmation.** A destructive action behind a single click is a footgun. The fix is a tiny Client Component wrapping just the submit button — the surrounding `<form action={deleteDocument}>` (the Server Action) doesn't change:
+```tsx
+// app/DeleteButton.tsx
+'use client'
+
+export function DeleteButton({ className }: { className?: string }) {
+  return (
+    <button
+      type="submit"
+      className={className}
+      onClick={(e) => {
+        if (!confirm('Delete this document? This cannot be undone.')) {
+          e.preventDefault()
+        }
+      }}
+    >
+      Delete
+    </button>
+  )
+}
+```
+`confirm()` blocks until the user answers; canceling calls `e.preventDefault()` on the click, which stops the `<button type="submit">` from submitting its form. No modal library needed for a one-off confirmation like this.
+
+**b) Buttons didn't look clickable.** Only `<a>` gets a pointer cursor by default in most browsers — a plain `<button>` shows the regular arrow cursor unless you say otherwise. One global rule in `app/globals.css` fixes every button in the app at once, instead of adding `cursor-pointer` to every className string:
+```css
+button:not(:disabled) {
+  cursor: pointer;
+}
+```
+
+**c) Searching every field — and the PostgREST limit we hit.** The original search only checked `title`/`client`. Widening it to `status` was trivial (another `ilike` in the same `or()`), but the `assignees.name` and `due_date` columns exposed a real PostgREST constraint, confirmed by testing directly against the REST API before writing any code:
+```bash
+# column::type casts are rejected *inside* an or() filter:
+curl ".../documents?or=(title.ilike.%25x%25,due_date::text.ilike.%252026%25)"
+# → 400 PGRST100 "unexpected \":\" ... failed to parse logic tree"
+```
+So `due_date` can't be substring-searched this way (dates rarely benefit from that anyway). `assignees.name` lives on a joined table, and `or()` can't filter an embedded resource's column directly — so it's resolved with a small lookup first, then matching documents by the resulting ids:
+```ts
+const orParts = [
+  `title.ilike.%${safeQ}%`,
+  `client.ilike.%${safeQ}%`,
+  `status.ilike.%${safeQ}%`,
+]
+const { data: matchingAssignees } = await supabase
+  .from('assignees').select('id').ilike('name', `%${safeQ}%`)
+if (matchingAssignees?.length) {
+  orParts.push(`assignee_id.in.(${matchingAssignees.map((a) => a.id).join(',')})`)
+}
+query = query.or(orParts.join(','))
+```
+
+**d) Live search, debounced.** Typing should update the results without clicking a "Filter" button — that needs a Client Component, since it requires reacting to every keystroke. `app/Filters.tsx` replaces the old GET `<form>`:
+```tsx
+'use client'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
+import { useRef, useState, useTransition } from 'react'
+
+const DEBOUNCE_MS = 350
+
+export function Filters({ defaultQ, defaultStatus }: { defaultQ: string; defaultStatus: string }) {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const [q, setQ] = useState(defaultQ)
+  const [isPending, startTransition] = useTransition()
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  function navigate(nextQ: string, nextStatus: string) {
+    const params = new URLSearchParams(searchParams.toString())
+    if (nextQ) params.set('q', nextQ); else params.delete('q')
+    if (nextStatus) params.set('status', nextStatus); else params.delete('status')
+    params.delete('page')
+    startTransition(() => router.replace(`${pathname}?${params.toString()}`))
+  }
+
+  function handleQChange(value: string) {
+    setQ(value)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => navigate(value, /* current status */ ''), DEBOUNCE_MS)
+  }
+  // ...status select calls navigate(q, value) immediately on change, no debounce needed
+}
+```
+`useTransition` marks the URL update as low-priority so typing stays responsive, and drives a small "Searching…" indicator via `isPending`. Debouncing means the Server Component (and the Supabase query) only re-runs ~350ms after the user stops typing, not on every keystroke.
+
+One easy-to-miss detail: the component's local `q`/`status` state needs to follow the props when the URL changes from *outside* the component (browser back/forward, a pasted link). Syncing them in a `useEffect` triggers React's `set-state-in-effect` lint rule (cascading renders) — the fix is adjusting state directly during render, which React explicitly documents as safe for this exact case:
+```tsx
+const [prevDefaultQ, setPrevDefaultQ] = useState(defaultQ)
+if (defaultQ !== prevDefaultQ) {
+  setPrevDefaultQ(defaultQ)
+  setQ(defaultQ)
+}
+```
+
+> Net effect: three of four pieces (delete confirmation, cursor, and the wider search predicate) needed no new client-side state at all. Only "search as you type" genuinely requires a Client Component — everything else stays server-first.
 
 ---
 

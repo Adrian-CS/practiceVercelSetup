@@ -561,7 +561,105 @@ function pageHref({ q, status, page }: { q: string; status: string; page: number
 }
 ```
 
-> クライアントコンポーネントが不要な理由:検索・フィルター・ページ送りはすべて GET フォームとリンクだけで表現できる — アプリの他の部分と同じ「サーバーファースト」なやり方。`useState` もデバウンスも要らず、JavaScript が無効でも動く。`q`/`status`/`page` が URL に乗るので、その時点の表示状態をブックマーク・共有できるのも利点。
+> クライアントコンポーネントが不要な理由(第1版):検索・フィルター・ページ送りはすべて GET フォームとリンクだけで表現できていた — アプリの他の部分と同じ「サーバーファースト」なやり方。`useState` もデバウンスも要らず、JavaScript が無効でも動いた。`q`/`status`/`page` が URL に乗るので、その時点の表示状態をブックマーク・共有できるのも利点だった。ステップ16 でこれを見直す:入力しながらリアルタイムに検索するにはやはりクライアントコンポーネントが必要になる。
+
+## ステップ16 — 削除確認、カーソルのフィードバック、全項目対応のリアルタイム検索
+
+**a) 削除には確認が必要。** 破壊的な操作がワンクリックでできてしまうのは事故のもと。修正は submit ボタンだけを包む小さなクライアントコンポーネント — 周りの `<form action={deleteDocument}>`(Server Action)はそのまま:
+```tsx
+// app/DeleteButton.tsx
+'use client'
+
+export function DeleteButton({ className }: { className?: string }) {
+  return (
+    <button
+      type="submit"
+      className={className}
+      onClick={(e) => {
+        if (!confirm('Delete this document? This cannot be undone.')) {
+          e.preventDefault()
+        }
+      }}
+    >
+      Delete
+    </button>
+  )
+}
+```
+`confirm()` はユーザーが答えるまでブロックする。キャンセルするとクリックに対して `e.preventDefault()` が呼ばれ、`<button type="submit">` によるフォーム送信が止まる。この程度の一回きりの確認にモーダルライブラリは不要。
+
+**b) ボタンがクリックできるように見えなかった。** ほとんどのブラウザでポインターカーソルが既定で付くのは `<a>` だけ — 普通の `<button>` は何も指定しなければ通常の矢印カーソルのまま。`app/globals.css` にルールを1つ足せば、各 className に `cursor-pointer` を追加して回るのではなく、アプリ内の全ボタンに一括で効く:
+```css
+button:not(:disabled) {
+  cursor: pointer;
+}
+```
+
+**c) 全項目を検索対象に — そこで突き当たった PostgREST の制限。** 元の検索は `title`/`client` しか見ていなかった。`status` を足すのは簡単だった(同じ `or()` に `ilike` をもう1つ足すだけ)が、`assignees.name` と `due_date` の列で、コードを書く前に REST API へ直接テストして確認した本物の PostgREST の制約に突き当たった:
+```bash
+# or() フィルターの *内側* では column::type のキャストが拒否される:
+curl ".../documents?or=(title.ilike.%25x%25,due_date::text.ilike.%252026%25)"
+# → 400 PGRST100 "unexpected \":\" ... failed to parse logic tree"
+```
+そのため `due_date` はこの方法では部分一致検索できない(そもそも日付の部分一致はあまり意味がない)。`assignees.name` は結合先テーブルの列であり、`or()` は埋め込みリソースの列を直接フィルターできない — そこで先に該当する担当者を検索し、その id で documents を絞り込む:
+```ts
+const orParts = [
+  `title.ilike.%${safeQ}%`,
+  `client.ilike.%${safeQ}%`,
+  `status.ilike.%${safeQ}%`,
+]
+const { data: matchingAssignees } = await supabase
+  .from('assignees').select('id').ilike('name', `%${safeQ}%`)
+if (matchingAssignees?.length) {
+  orParts.push(`assignee_id.in.(${matchingAssignees.map((a) => a.id).join(',')})`)
+}
+query = query.or(orParts.join(','))
+```
+
+**d) デバウンス付きのリアルタイム検索。** 「Filter」ボタンを押さなくても入力するだけで結果が更新されてほしい — 1文字ごとに反応する必要があるので、これはクライアントコンポーネントが要る。`app/Filters.tsx` が従来の GET `<form>` を置き換える:
+```tsx
+'use client'
+import { usePathname, useRouter, useSearchParams } from 'next/navigation'
+import { useRef, useState, useTransition } from 'react'
+
+const DEBOUNCE_MS = 350
+
+export function Filters({ defaultQ, defaultStatus }: { defaultQ: string; defaultStatus: string }) {
+  const router = useRouter()
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const [q, setQ] = useState(defaultQ)
+  const [isPending, startTransition] = useTransition()
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  function navigate(nextQ: string, nextStatus: string) {
+    const params = new URLSearchParams(searchParams.toString())
+    if (nextQ) params.set('q', nextQ); else params.delete('q')
+    if (nextStatus) params.set('status', nextStatus); else params.delete('status')
+    params.delete('page')
+    startTransition(() => router.replace(`${pathname}?${params.toString()}`))
+  }
+
+  function handleQChange(value: string) {
+    setQ(value)
+    if (debounceRef.current) clearTimeout(debounceRef.current)
+    debounceRef.current = setTimeout(() => navigate(value, /* current status */ ''), DEBOUNCE_MS)
+  }
+  // ...status のセレクトは変更時に navigate(q, value) を即座に呼ぶ(デバウンス不要)
+}
+```
+`useTransition` は URL 更新を低優先度としてマークし、入力のもたつきを防ぎつつ、`isPending` で小さな「Searching…」表示を出す。デバウンスにより、Server Component(と Supabase へのクエリ)は入力を止めてから約350ms後にだけ再実行される。
+
+見落としやすい点が1つ:コンポーネントのローカルな `q`/`status` state は、URL がコンポーネントの *外側* から変わったとき(ブラウザの戻る/進む、貼り付けられたリンクなど)に props へ追従する必要がある。これを `useEffect` で同期すると React の `set-state-in-effect` ルール(カスケード的な再レンダー)に引っかかる — 修正は、render 中に直接 state を調整する方法で、React 自身がこのケースでは安全だと明言している:
+```tsx
+const [prevDefaultQ, setPrevDefaultQ] = useState(defaultQ)
+if (defaultQ !== prevDefaultQ) {
+  setPrevDefaultQ(defaultQ)
+  setQ(defaultQ)
+}
+```
+
+> 結果:4つの変更のうち3つ(削除確認・カーソル・検索対象の拡大)はクライアント側の state を一切必要としなかった。「入力しながら検索」だけが本当にクライアントコンポーネントを要求する — それ以外はサーバーファーストのまま。
 
 ---
 

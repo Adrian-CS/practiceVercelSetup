@@ -16,6 +16,8 @@ export const buttonSecondaryClass =
 
 export const linkClass = 'text-blue-600 hover:underline dark:text-blue-400'
 
+export const STATUSES = ['pending', 'in_progress', 'completed'] as const
+
 const STATUS_STYLES: Record<string, string> = {
   pending: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
   in_progress: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
