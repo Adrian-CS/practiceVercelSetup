@@ -2,6 +2,7 @@
 import { createClient } from '@/lib/supabase/client'
 import { useRouter } from 'next/navigation'
 import { useState } from 'react'
+import { buttonPrimaryClass, inputClass, labelClass } from '@/lib/ui'
 
 export default function Login() {
   const supabase = createClient()
@@ -19,16 +20,38 @@ export default function Login() {
   }
 
   return (
-    <main className="max-w-sm mx-auto p-8">
-      <h1 className="text-xl font-bold mb-4">Log in</h1>
-      <form onSubmit={handleLogin} className="space-y-3">
-        {error && <p className="text-red-500 text-sm">{error}</p>}
-        <input type="email" value={email} onChange={e => setEmail(e.target.value)}
-          placeholder="Email" required className="border p-2 w-full" />
-        <input type="password" value={password} onChange={e => setPassword(e.target.value)}
-          placeholder="Password" required className="border p-2 w-full" />
-        <button className="bg-blue-600 text-white px-4 py-2 rounded w-full">Log in</button>
-      </form>
+    <main className="mx-auto flex min-h-full max-w-sm items-center p-4 sm:p-8">
+      <div className="w-full rounded-lg border border-gray-200 p-6 shadow-sm dark:border-gray-800">
+        <h1 className="mb-4 text-xl font-bold">Log in</h1>
+        <form onSubmit={handleLogin} className="space-y-4">
+          {error && <p className="text-sm text-red-500">{error}</p>}
+          <div>
+            <label htmlFor="email" className={labelClass}>Email</label>
+            <input
+              id="email"
+              type="email"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              required
+              className={inputClass}
+            />
+          </div>
+          <div>
+            <label htmlFor="password" className={labelClass}>Password</label>
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              placeholder="••••••••"
+              required
+              className={inputClass}
+            />
+          </div>
+          <button className={`${buttonPrimaryClass} w-full`}>Log in</button>
+        </form>
+      </div>
     </main>
   )
 }

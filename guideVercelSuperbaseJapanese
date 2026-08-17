@@ -1,0 +1,568 @@
+# ガイド:Next.js + Supabase + Vercel による書類管理システム
+
+**期限と担当者**を管理する書類管理システム(日機装案件の想定ケース)を、インターネット公開・ログイン付き・テスト→本番のフロー付きで構築する。
+
+**イメージ:** Supabase = バックエンド(PostgreSQL DB + API + 認証がすでに用意されている)。Vercel = フロント(Next.js をグローバル CDN でホスティング)。自分はページとクエリを書くだけ。サーバーの構築・運用は不要。
+
+> 補足:現在のセットアップは `@supabase/ssr` パッケージを使う。旧 `@supabase/auth-helpers` は非推奨。
+
+---
+
+## ステップ0 — 前提
+- Node 18+、supabase.com と vercel.com のアカウント(どちらも無料)。
+
+## ステップ1 — Next.js プロジェクト作成
+```bash
+npx create-next-app@latest gestor-documents
+# TypeScript ✅, App Router ✅, Tailwind ✅
+cd gestor-documents
+npm install @supabase/supabase-js @supabase/ssr
+```
+`@supabase/supabase-js` は SDK。`@supabase/ssr` は App Router でセッションを機能させる(ブラウザ用クライアントと、Cookie を扱うサーバー用クライアント)。
+
+## ステップ2 — Supabase プロジェクト作成(東京リージョン)
+1. supabase.com → **New project**。**Region = Northeast Asia (Tokyo)** → 日本・ベトナムに高速。
+2. **Project Settings → API**:**Project URL** と **anon/publishable key** をコピー。
+
+## ステップ3 — スキーマ作成(SQL)
+ダッシュボード → **SQL Editor** → 実行:
+```sql
+create table assignees (
+  id bigint generated always as identity primary key,
+  name text not null,
+  email text
+);
+
+create table documents (
+  id bigint generated always as identity primary key,
+  title text not null,
+  client text,
+  due_date date not null,
+  status text not null default 'pending'
+    check (status in ('pending','in_progress','completed')),
+  assignee_id bigint references assignees(id),
+  created_at timestamptz default now()
+);
+
+insert into assignees (name, email) values
+  ('Tanaka Taro','tanaka@example.com'),
+  ('Adrian','adrian@example.com');
+
+insert into documents (title, client, due_date, status, assignee_id) values
+  ('Contract A','Client X','2026-09-15','pending',1),
+  ('Report B','Client Y','2026-08-20','in_progress',2);
+```
+`assignee_id references assignees(id)` は1対多のリレーション。`check` は状態を DB レベルで検証する。
+
+RLS(行レベルセキュリティ)を有効化。開発用に緩いポリシー(ステップ8で厳格化):
+```sql
+alter table documents enable row level security;
+alter table assignees enable row level security;
+create policy "dev_all_docs" on documents for all using (true) with check (true);
+create policy "dev_all_resp" on assignees for all using (true) with check (true);
+```
+> セキュリティ:`using (true)` はテーブルを開放する(開発専用)。ステップ8で認証済みユーザーに限定する。
+
+## ステップ3b — データベースの型を生成
+
+TypeScript がスキーマを認識できるように(そして**多対一**のリレーションが配列ではなくオブジェクトとして型付けされるように)、DB から型を生成する:
+```bash
+npx supabase login          # ブラウザで認証(初回のみ)
+npx supabase gen types typescript --project-id <your-project-ref> --schema public > lib/database.types.ts
+```
+`<your-project-ref>` はダッシュボードの **Project Settings → General → Reference ID**(またはプロジェクト URL)にある。初回は npx が `supabase` パッケージ(公式 CLI)のインストールを尋ねるので `y` で承認する。
+
+> スキーマを変更するたびにこのファイルを再生成すれば、型がずれることはない。任意:`npm install -D supabase` と package.json の `"gen:types"` スクリプト。
+
+## ステップ4 — Supabase クライアントの設定
+`lib/supabase/client.ts`(ブラウザ用):
+```ts
+import { createBrowserClient } from '@supabase/ssr'
+import { Database } from '@/lib/database.types'
+
+export function createClient() {
+  return createBrowserClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+```
+`lib/supabase/server.ts`(サーバー用;Cookie を読む):
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+import { Database } from '@/lib/database.types'
+
+export async function createClient() {
+  const cookieStore = await cookies()
+  return createServerClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() { return cookieStore.getAll() },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options))
+          } catch { /* Server Component: middleware が処理 */ }
+        },
+      },
+    }
+  )
+}
+```
+クライアントが2つあるのは、サーバーとブラウザでセッションの扱いが異なるため(サーバーは Cookie から、ブラウザは自身のコンテキストから)。
+
+## ステップ5 — 環境変数
+ルートに `.env.local`:
+```bash
+NEXT_PUBLIC_SUPABASE_URL=https://yourproject.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...your_key...
+```
+`.env.local` は既定で `.gitignore` に入っている — 絶対に git に上げない。
+
+## ステップ6 — Server Actions(作成・編集・削除・ログアウト)
+
+すべての変更処理を `app/actions.ts` に集約する。サーバーで実行され、`<form>` から呼ばれる。
+```ts
+'use server'
+import { createClient } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+
+export async function createDocument(formData: FormData) {
+  const supabase = await createClient()
+  await supabase.from('documents').insert({
+    title: formData.get('title') as string,
+    client: formData.get('client') as string,
+    due_date: formData.get('due_date') as string,
+    assignee_id: Number(formData.get('assignee_id')),
+  })
+  revalidatePath('/')
+  redirect('/')
+}
+
+export async function updateDocument(formData: FormData) {
+  const supabase = await createClient()
+  const id = Number(formData.get('id'))
+  await supabase.from('documents').update({
+    title: formData.get('title') as string,
+    client: formData.get('client') as string,
+    due_date: formData.get('due_date') as string,
+    status: formData.get('status') as string,
+    assignee_id: Number(formData.get('assignee_id')),
+  }).eq('id', id)
+  revalidatePath('/')
+  redirect('/')
+}
+
+export async function deleteDocument(formData: FormData) {
+  const supabase = await createClient()
+  await supabase.from('documents').delete().eq('id', Number(formData.get('id')))
+  revalidatePath('/')
+}
+
+export async function logout() {
+  const supabase = await createClient()
+  await supabase.auth.signOut()
+  redirect('/login')
+}
+```
+`revalidatePath('/')` は変更後に一覧を更新、`redirect('/')` はトップへ戻す。`delete` はリダイレクトしない(一覧に留まる)。
+
+## ステップ7 — トップページ(一覧 + ナビゲーション)
+
+`app/page.tsx` は書類を一覧表示し、他画面へリンクする:「New document」(→ `/new`)、行ごとの「Edit」(→ `/documents/[id]/edit`)、「Delete」(form)、「Log out」。
+```tsx
+import { createClient } from '@/lib/supabase/server'
+import { deleteDocument, logout } from './actions'
+import Link from 'next/link'
+
+export default async function Home() {
+  const supabase = await createClient()
+  const { data: documents } = await supabase
+    .from('documents')
+    .select('id, title, client, due_date, status, assignees(name)')
+    .order('due_date', { ascending: true })
+
+  return (
+    <main className="max-w-3xl mx-auto p-8">
+      <div className="flex justify-between items-center mb-4">
+        <h1 className="text-2xl font-bold">Document management</h1>
+        <div className="flex gap-2">
+          <Link href="/new" className="bg-blue-600 text-white px-3 py-1 rounded">New document</Link>
+          <form action={logout}><button className="border px-3 py-1 rounded">Log out</button></form>
+        </div>
+      </div>
+      <table className="w-full border-collapse">
+        <thead>
+          <tr className="border-b text-left">
+            <th className="py-2">Title</th><th>Client</th><th>Due date</th>
+            <th>Assignee</th><th>Status</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {documents?.map((d) => (
+            <tr key={d.id} className="border-b">
+              <td className="py-2">{d.title}</td>
+              <td>{d.client}</td>
+              <td>{d.due_date}</td>
+              <td>{d.assignees?.name}</td>
+              <td>{d.status}</td>
+              <td className="flex gap-3 py-2">
+                <Link href={`/documents/${d.id}/edit`} className="text-blue-600">Edit</Link>
+                <form action={deleteDocument}>
+                  <input type="hidden" name="id" value={d.id} />
+                  <button className="text-red-600">Delete</button>
+                </form>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </main>
+  )
+}
+```
+Server Component なのでクエリはサーバーで実行。`assignees` は多対一なのでオブジェクト → `d.assignees?.name`。Delete と Log out は Server Actions を呼ぶ `<form>`。
+
+## ステップ8 — 新規作成ページ
+
+`app/new/page.tsx`:
+```tsx
+import { createDocument } from '../actions'
+import Link from 'next/link'
+
+export default function NewDocument() {
+  return (
+    <main className="max-w-md mx-auto p-8">
+      <Link href="/" className="text-blue-600">← Back</Link>
+      <h1 className="text-xl font-bold my-4">New document</h1>
+      <form action={createDocument} className="space-y-3">
+        <input name="title" placeholder="Title" required className="border p-2 w-full" />
+        <input name="client" placeholder="Client" className="border p-2 w-full" />
+        <input name="due_date" type="date" required className="border p-2 w-full" />
+        <input name="assignee_id" type="number" placeholder="Assignee ID" className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded">Save</button>
+      </form>
+    </main>
+  )
+}
+```
+
+## ステップ9 — 編集ページ
+
+`app/documents/[id]/edit/page.tsx` は書類を読み込みフォームを初期値で埋める:
+```tsx
+import { createClient } from '@/lib/supabase/server'
+import { updateDocument } from '@/app/actions'
+import { notFound } from 'next/navigation'
+import Link from 'next/link'
+
+export default async function EditDocument({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params
+  const supabase = await createClient()
+  const { data: doc } = await supabase
+    .from('documents')
+    .select('id, title, client, due_date, status, assignee_id')
+    .eq('id', Number(id))
+    .single()
+
+  if (!doc) notFound()
+
+  return (
+    <main className="max-w-md mx-auto p-8">
+      <Link href="/" className="text-blue-600">← Back</Link>
+      <h1 className="text-xl font-bold my-4">Edit document</h1>
+      <form action={updateDocument} className="space-y-3">
+        <input type="hidden" name="id" value={doc.id} />
+        <input name="title" defaultValue={doc.title} required className="border p-2 w-full" />
+        <input name="client" defaultValue={doc.client ?? ''} className="border p-2 w-full" />
+        <input name="due_date" type="date" defaultValue={doc.due_date} required className="border p-2 w-full" />
+        <select name="status" defaultValue={doc.status} className="border p-2 w-full">
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="completed">completed</option>
+        </select>
+        <input name="assignee_id" type="number" defaultValue={doc.assignee_id ?? ''} className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded">Update</button>
+      </form>
+    </main>
+  )
+}
+```
+Next 15 では `params` は Promise なので `await params`。`defaultValue` で各項目を初期化。`id` は hidden input で送り、`updateDocument` がどの行を更新するかを判断する。
+
+## ステップ10 — 認証(実際のログイン)
+
+**a) Email 認証を有効化。** Supabase → **Authentication → Providers → Email**(有効)。**Authentication → Users → Add user** でテストユーザー(メール + パスワード)を作成。
+
+**b) セッションを更新する middleware。** `lib/supabase/middleware.ts`:
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function updateSession(request: NextRequest) {
+  let response = NextResponse.next({ request })
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() { return request.cookies.getAll() },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
+          response = NextResponse.next({ request })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options))
+        },
+      },
+    }
+  )
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user && !request.nextUrl.pathname.startsWith('/login')) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/login'
+    return NextResponse.redirect(url)
+  }
+  return response
+}
+```
+`proxy.ts`(プロジェクトのルート):
+```ts
+import { type NextRequest } from 'next/server'
+import { updateSession } from '@/lib/supabase/middleware'
+
+export async function proxy(request: NextRequest) {
+  return await updateSession(request)
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'],
+}
+```
+proxy はリクエストごとにトークンを更新し(Server Component は Cookie を書けない)、セッションが無ければ `/login` へリダイレクトする。
+
+> **Next.js 16:** `middleware.ts` は非推奨となり `proxy.ts` に改名された(関数 `middleware` → `proxy`)。挙動は同じで名前だけの変更。注意:改名せず残した `middleware.ts` は黙って無視されるため、ルート保護が効かなくなる。`npx @next/codemod@latest middleware-to-proxy .` で移行する。ヘルパー `lib/supabase/middleware.ts` は名前を変えなくてよい(規約ファイルではない)。
+
+**c) ログインページ。** `app/login/page.tsx`:
+```tsx
+'use client'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { useState } from 'react'
+
+export default function Login() {
+  const supabase = createClient()
+  const router = useRouter()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+
+  async function handleLogin(e: React.FormEvent) {
+    e.preventDefault()
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) { setError(error.message); return }
+    router.push('/')
+    router.refresh()
+  }
+
+  return (
+    <main className="max-w-sm mx-auto p-8">
+      <h1 className="text-xl font-bold mb-4">Log in</h1>
+      <form onSubmit={handleLogin} className="space-y-3">
+        {error && <p className="text-red-500 text-sm">{error}</p>}
+        <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+          placeholder="Email" required className="border p-2 w-full" />
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+          placeholder="Password" required className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded w-full">Log in</button>
+      </form>
+    </main>
+  )
+}
+```
+
+**d) RLS を厳格化。** ログインができたので、開発用ポリシーを置き換える。社内共有ツール(全社員が全書類を閲覧)の場合:
+```sql
+drop policy "dev_all_docs" on documents;
+drop policy "dev_all_resp" on assignees;
+create policy "auth_all_docs" on documents for all
+  using (auth.uid() is not null) with check (auth.uid() is not null);
+create policy "auth_all_resp" on assignees for all
+  using (auth.uid() is not null) with check (auth.uid() is not null);
+```
+> 各ユーザーが自分の行だけ見る場合:`owner_id uuid default auth.uid()` 列を追加し、`using (auth.uid() = owner_id)` を使う。
+
+## ステップ11 — ナビゲーションマップ(画面のつながり)
+
+- `/`(`app/page.tsx`):一覧。`/new` と `/documents/[id]/edit` へリンク。Delete と Log out は `<form>` → Server Actions。セッションが無ければ middleware が `/login` へリダイレクト。
+- `/new`(`app/new/page.tsx`):フォーム → `createDocument` → `/` に戻る。
+- `/documents/[id]/edit`:初期値入りフォーム → `updateDocument` → `/` に戻る。
+- `/login`(`app/login/page.tsx`):`signInWithPassword` → `/`。Log out(`logout`)でここへ戻る。
+- すべての変更処理は `app/actions.ts` にある。
+
+```
+app/
+├── actions.ts          # Server Actions (create/update/delete/logout)
+├── page.tsx            # list + navigation (protected)
+├── login/page.tsx      # login
+├── new/page.tsx        # create
+└── documents/[id]/edit/page.tsx   # edit
+lib/supabase/{client,server,middleware}.ts
+middleware.ts
+```
+
+## ステップ12 — Vercel へデプロイ
+1. プロジェクトを GitHub へ push(`git init`, commit, push)。
+2. vercel.com → **Add New → Project** → リポジトリをインポート。
+3. **Environment Variables**:`NEXT_PUBLIC_SUPABASE_URL` と `NEXT_PUBLIC_SUPABASE_ANON_KEY` を貼り付け。
+4. **Deploy** → 約1分で `https://...vercel.app` が日本・ベトナムからアクセス可能に。
+
+以降は `git push` ごとに自動で再デプロイ。
+
+## ステップ13 — テスト → 本番のフロー
+
+Vercel は git のブランチを使って、このフローを既定で提供する:
+
+- **Preview(テスト):** `main` 以外のブランチへの `push`、または Pull Request ごとに、**独自の一意な URL** のデプロイが生成される。これがテスト環境。
+- **Production(本番):** `main` への `push`/merge のみが本番 URL を更新する。本番へは必ずここを経由する。
+
+典型的なフロー:
+```bash
+git checkout -b feature/new-screen
+# ...変更...
+git push origin feature/new-screen   # → Vercel が自動で Preview を作成
+# preview の URL で確認。OK なら:
+git checkout main
+git merge feature/new-screen
+git push origin main                  # → 本番を更新
+```
+Pull Request 利用(チームでは推奨):PR を開く → Vercel が preview リンクをコメント → レビュー → `main` へ merge → 本番。
+
+**環境ごとの変数(重要)。** Vercel → **Settings → Environment Variables** で各変数を **Production / Preview / Development** に個別に割り当てられる。推奨:**Supabase プロジェクトを2つ**(テスト用・本番用)用意し、Preview の変数はテスト DB を、Production の変数は本番 DB を指す。これで本番データに触れずにテストできる。
+
+補足:
+- Hobby(無料)プランでも Preview は無制限。
+- Preview にログイン保護をかけて非公開にできる。
+- デプロイ前の自動テストは GitHub Actions と連携可能。
+
+## ステップ14 — マイグレーションと環境(スキーマをコードで管理)
+
+コピペを避ける考え方:スキーマは repo 内の**マイグレーションファイル**として管理し、各環境はそこから再構築する。本番データはコピーしない。preview のデータはシード(seed)データ。
+
+Supabase を初期化し、現在のスキーマをマイグレーションとして取得:
+```bash
+npx supabase init
+npx supabase login
+npx supabase link --project-ref <PROD-ref>
+npx supabase db pull          # supabase/migrations/<ts>_remote_schema.sql を生成
+```
+このファイルをコミットする。以降、変更ごとに:
+```bash
+npx supabase migration new add_something
+# 生成されたファイルに変更の SQL を書く
+```
+
+### オプションB — 2プロジェクトを同期(無料)
+
+1. 2つ目の Supabase プロジェクト(例:`staging`)を東京リージョンで作成。URL と anon key を控える。
+2. re-link しながら各環境にマイグレーションを適用:
+```bash
+# staging
+npx supabase link --project-ref <STAGING-ref>
+npx supabase db push
+# 本番(staging で検証後)
+npx supabase link --project-ref <PROD-ref>
+npx supabase db push
+```
+3. テストデータは staging のみ:`supabase/seed.sql`(または staging の SQL Editor)にサンプル INSERT。本番はそのまま。
+4. Vercel → **Settings → Environment Variables** で環境ごとに割り当て:
+   - **Production** → 本番の URL + anon key。
+   - **Preview**(と Development)→ staging の URL + anon key。
+
+結果:preview のデプロイは staging DB を、本番は本番 DB を使う。同期するのは**スキーマ**(マイグレーション)であって、データではない。
+
+> セキュリティ:DB パスワードや接続文字列を絶対に git に上げない。
+> 自動化の代替:**Supabase Branching** は PR ごとにこれを自動で行う(独立した preview + Vercel の変数)が、有料プランが必要(約 $0.013/ブランチ/時)。
+
+## ステップ15 — レスポンシブUI、検索・フィルター・ページネーション
+
+**a) 共通スタイルトークン。** `lib/ui.tsx` に、input・button・label・link で使う Tailwind クラスと `StatusBadge` コンポーネントをまとめる。これで `/`、`/new`、`/documents/[id]/edit`、`/login` の見た目が揃う(各ページが個別にクラスを書かなくて済む):
+```tsx
+export const inputClass =
+  'w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100'
+
+const STATUS_STYLES: Record<string, string> = {
+  pending: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  in_progress: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
+  completed: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300',
+}
+
+export function StatusBadge({ status }: { status: string }) {
+  const style = STATUS_STYLES[status] ?? 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300'
+  return <span className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ${style}`}>{status.replace('_', ' ')}</span>
+}
+```
+
+**b) レスポンシブなテーブル。** モバイル用に別の「カード」レイアウトを作る(コード量が増え、2つの描画経路を同期し続ける必要がある)代わりに、副次的な列をブレークポイントごとに隠す:
+```tsx
+<th className="hidden px-4 py-3 sm:table-cell">Client</th>
+<th className="hidden px-4 py-3 md:table-cell">Assignee</th>
+```
+タイトル・期限・状態・操作はどの画面幅でも常に表示。テーブル自体も `overflow-x-auto` で囲み、非常に狭い画面でも崩れないようにする。
+
+**c) 検索・フィルター — クライアントコンポーネント不要。** 通常の GET `<form>` が `/?q=...&status=...` へそのまま遷移する。ブラウザがナビゲーションを行うので `onChange`/`useState`/デバウンスは不要:
+```tsx
+<form action="/" className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+  <input name="q" defaultValue={q} placeholder="Title or client…" className={inputClass} />
+  <select name="status" defaultValue={status} className={inputClass}>
+    <option value="">All statuses</option>
+    {STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+  </select>
+  <button className={buttonPrimaryClass}>Filter</button>
+</form>
+```
+`Home` は `searchParams`(App Router では `Promise`)から `q`/`status`/`page` を読み取り、クエリを組み立てる:
+```ts
+const { q = '', status = '', page: pageParam } = await searchParams
+const page = Math.max(1, Number(pageParam) || 1)
+
+let query = supabase
+  .from('documents')
+  .select('id, title, client, due_date, status, assignees(name)', { count: 'exact' })
+  .order('due_date', { ascending: true })
+
+// PostgREST の or() フィルター構文で特別な意味を持つ文字
+// (カンマは条件の区切り、括弧はグループ化)を除去し、
+// 検索語がクエリを壊さないようにする。
+const safeQ = q.replace(/[,()]/g, '').trim()
+if (safeQ) query = query.or(`title.ilike.%${safeQ}%,client.ilike.%${safeQ}%`)
+if (status) query = query.eq('status', status)
+```
+
+**d) ページネーション。** `select` に `{ count: 'exact' }` を付け `.range(from, to)` を組み合わせると、1回のリクエストでそのページの行と全体件数の両方が取れる:
+```ts
+const PAGE_SIZE = 10
+const from = (page - 1) * PAGE_SIZE
+const { data: documents, count, error } = await query.range(from, from + PAGE_SIZE - 1)
+const totalPages = Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE))
+```
+`Previous`/`Next` は通常の `<Link>` で、小さなヘルパーが `q` と `status` を引き継ぎ、`page` は 1 でないときだけ URL に付ける(ページ1は素の `/` のまま):
+```ts
+function pageHref({ q, status, page }: { q: string; status: string; page: number }) {
+  const sp = new URLSearchParams()
+  if (q) sp.set('q', q)
+  if (status) sp.set('status', status)
+  if (page > 1) sp.set('page', String(page))
+  const qs = sp.toString()
+  return qs ? `/?${qs}` : '/'
+}
+```
+
+> クライアントコンポーネントが不要な理由:検索・フィルター・ページ送りはすべて GET フォームとリンクだけで表現できる — アプリの他の部分と同じ「サーバーファースト」なやり方。`useState` もデバウンスも要らず、JavaScript が無効でも動く。`q`/`status`/`page` が URL に乗るので、その時点の表示状態をブックマーク・共有できるのも利点。
+
+---
+
+**まとめ:** Supabase = 出来合いのバックエンド(DB + API + 認証)、Vercel = グローバルなフロント + git ベースのテスト→本番フロー。自分はページとクエリを書くだけ。VM を自前で運用する方式に比べ、最速・最安である理由がこれ。

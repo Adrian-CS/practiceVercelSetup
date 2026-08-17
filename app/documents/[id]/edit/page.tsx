@@ -2,6 +2,7 @@ import { createClient } from '@/lib/supabase/server'
 import { updateDocument } from '@/app/actions'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
+import { buttonPrimaryClass, inputClass, labelClass, linkClass } from '@/lib/ui'
 
 export default async function EditDocument({ params }: { params: Promise<{ id: string }> }) {
   const { id } = await params
@@ -15,21 +16,49 @@ export default async function EditDocument({ params }: { params: Promise<{ id: s
   if (!doc) notFound()
 
   return (
-    <main className="max-w-md mx-auto p-8">
-      <Link href="/" className="text-blue-600">← Back</Link>
-      <h1 className="text-xl font-bold my-4">Edit document</h1>
-      <form action={updateDocument} className="space-y-3">
+    <main className="mx-auto max-w-md p-4 sm:p-8">
+      <Link href="/" className={`text-sm ${linkClass}`}>← Back</Link>
+      <h1 className="my-4 text-xl font-bold">Edit document</h1>
+      <form action={updateDocument} className="space-y-4">
         <input type="hidden" name="id" value={doc.id} />
-        <input name="title" defaultValue={doc.title} required className="border p-2 w-full" />
-        <input name="client" defaultValue={doc.client ?? ''} className="border p-2 w-full" />
-        <input name="due_date" type="date" defaultValue={doc.due_date} required className="border p-2 w-full" />
-        <select name="status" defaultValue={doc.status} className="border p-2 w-full">
-          <option value="pending">pending</option>
-          <option value="in_progress">in_progress</option>
-          <option value="completed">completed</option>
-        </select>
-        <input name="assignee_id" type="number" defaultValue={doc.assignee_id ?? ''} className="border p-2 w-full" />
-        <button className="bg-blue-600 text-white px-4 py-2 rounded">Update</button>
+        <div>
+          <label htmlFor="title" className={labelClass}>Title</label>
+          <input id="title" name="title" defaultValue={doc.title} required className={inputClass} />
+        </div>
+        <div>
+          <label htmlFor="client" className={labelClass}>Client</label>
+          <input id="client" name="client" defaultValue={doc.client ?? ''} className={inputClass} />
+        </div>
+        <div>
+          <label htmlFor="due_date" className={labelClass}>Due date</label>
+          <input
+            id="due_date"
+            name="due_date"
+            type="date"
+            defaultValue={doc.due_date}
+            required
+            className={inputClass}
+          />
+        </div>
+        <div>
+          <label htmlFor="status" className={labelClass}>Status</label>
+          <select id="status" name="status" defaultValue={doc.status} className={inputClass}>
+            <option value="pending">pending</option>
+            <option value="in_progress">in_progress</option>
+            <option value="completed">completed</option>
+          </select>
+        </div>
+        <div>
+          <label htmlFor="assignee_id" className={labelClass}>Assignee ID</label>
+          <input
+            id="assignee_id"
+            name="assignee_id"
+            type="number"
+            defaultValue={doc.assignee_id ?? ''}
+            className={inputClass}
+          />
+        </div>
+        <button className={`${buttonPrimaryClass} w-full`}>Update</button>
       </form>
     </main>
   )

@@ -1,0 +1,568 @@
+# Guide: Document manager with Next.js + Supabase + Vercel
+
+We build a document management system with **deadlines and owners** (the Nikkiso use case), deployed to the internet, with login and a test→production flow.
+
+**Mental model:** Supabase = your backend (PostgreSQL DB + API + auth, ready-made). Vercel = your front end (hosts Next.js with a global CDN). You only write pages and queries; no servers to set up or maintain.
+
+> Note: the current setup uses the `@supabase/ssr` package. The old `@supabase/auth-helpers` is deprecated.
+
+---
+
+## Step 0 — Prerequisites
+- Node 18+, a supabase.com account and a vercel.com account (both free).
+
+## Step 1 — Create the Next.js project
+```bash
+npx create-next-app@latest gestor-documents
+# TypeScript ✅, App Router ✅, Tailwind ✅
+cd gestor-documents
+npm install @supabase/supabase-js @supabase/ssr
+```
+`@supabase/supabase-js` is the SDK; `@supabase/ssr` makes the session work with the App Router (browser client and server client with cookies).
+
+## Step 2 — Create the Supabase project (Tokyo region)
+1. supabase.com → **New project**. **Region = Northeast Asia (Tokyo)** → fast for Japan and Vietnam.
+2. **Project Settings → API**: copy the **Project URL** and the **anon/publishable key**.
+
+## Step 3 — Create the schema (SQL)
+Dashboard → **SQL Editor** → run:
+```sql
+create table assignees (
+  id bigint generated always as identity primary key,
+  name text not null,
+  email text
+);
+
+create table documents (
+  id bigint generated always as identity primary key,
+  title text not null,
+  client text,
+  due_date date not null,
+  status text not null default 'pending'
+    check (status in ('pending','in_progress','completed')),
+  assignee_id bigint references assignees(id),
+  created_at timestamptz default now()
+);
+
+insert into assignees (name, email) values
+  ('Tanaka Taro','tanaka@example.com'),
+  ('Adrian','adrian@example.com');
+
+insert into documents (title, client, due_date, status, assignee_id) values
+  ('Contract A','Client X','2026-09-15','pending',1),
+  ('Report B','Client Y','2026-08-20','in_progress',2);
+```
+`assignee_id references assignees(id)` is the 1-to-many relationship; the `check` validates the status at the DB level.
+
+Enable RLS (row-level security). For development, a permissive policy (we tighten it in Step 8):
+```sql
+alter table documents enable row level security;
+alter table assignees enable row level security;
+create policy "dev_all_docs" on documents for all using (true) with check (true);
+create policy "dev_all_resp" on assignees for all using (true) with check (true);
+```
+> Security: `using (true)` leaves the table open — development only. In Step 8 we restrict it to authenticated users.
+
+## Step 3b — Generate the database types
+
+So TypeScript knows your schema (and **many-to-one** relations are typed as an object, not an array), generate the types from your DB:
+```bash
+npx supabase login          # opens the browser to authenticate (once)
+npx supabase gen types typescript --project-id <your-project-ref> --schema public > lib/database.types.ts
+```
+`<your-project-ref>` is in the dashboard: **Project Settings → General → Reference ID** (or in the project URL). The first time, npx will ask to install the `supabase` package (the official CLI); accept with `y`.
+
+> Regenerate this file whenever you change the schema, so the types never drift. Optional: `npm install -D supabase` and a `"gen:types"` script in package.json.
+
+## Step 4 — Configure the Supabase clients
+`lib/supabase/client.ts` (browser):
+```ts
+import { createBrowserClient } from '@supabase/ssr'
+import { Database } from '@/lib/database.types'
+
+export function createClient() {
+  return createBrowserClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+```
+`lib/supabase/server.ts` (server; reads cookies):
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+import { Database } from '@/lib/database.types'
+
+export async function createClient() {
+  const cookieStore = await cookies()
+  return createServerClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() { return cookieStore.getAll() },
+        setAll(cookiesToSet) {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options))
+          } catch { /* Server Component: handled by middleware */ }
+        },
+      },
+    }
+  )
+}
+```
+There are two clients because server and browser handle the session differently: the server reads it from cookies, the browser from its own context.
+
+## Step 5 — Environment variables
+`.env.local` at the root:
+```bash
+NEXT_PUBLIC_SUPABASE_URL=https://yourproject.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...your_key...
+```
+`.env.local` is already in `.gitignore` — never commit it.
+
+## Step 6 — Server Actions (create, edit, delete, logout)
+
+We centralize all mutations in `app/actions.ts`. They run on the server and are called from a `<form>`.
+```ts
+'use server'
+import { createClient } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+
+export async function createDocument(formData: FormData) {
+  const supabase = await createClient()
+  await supabase.from('documents').insert({
+    title: formData.get('title') as string,
+    client: formData.get('client') as string,
+    due_date: formData.get('due_date') as string,
+    assignee_id: Number(formData.get('assignee_id')),
+  })
+  revalidatePath('/')
+  redirect('/')
+}
+
+export async function updateDocument(formData: FormData) {
+  const supabase = await createClient()
+  const id = Number(formData.get('id'))
+  await supabase.from('documents').update({
+    title: formData.get('title') as string,
+    client: formData.get('client') as string,
+    due_date: formData.get('due_date') as string,
+    status: formData.get('status') as string,
+    assignee_id: Number(formData.get('assignee_id')),
+  }).eq('id', id)
+  revalidatePath('/')
+  redirect('/')
+}
+
+export async function deleteDocument(formData: FormData) {
+  const supabase = await createClient()
+  await supabase.from('documents').delete().eq('id', Number(formData.get('id')))
+  revalidatePath('/')
+}
+
+export async function logout() {
+  const supabase = await createClient()
+  await supabase.auth.signOut()
+  redirect('/login')
+}
+```
+`revalidatePath('/')` refreshes the list after each change; `redirect('/')` returns home. `delete` doesn't redirect (you stay on the list).
+
+## Step 7 — Home page (list + navigation)
+
+`app/page.tsx` lists the documents and links to the rest: "New document" (→ `/new`), "Edit" per row (→ `/documents/[id]/edit`), "Delete" (form) and "Log out".
+```tsx
+import { createClient } from '@/lib/supabase/server'
+import { deleteDocument, logout } from './actions'
+import Link from 'next/link'
+
+export default async function Home() {
+  const supabase = await createClient()
+  const { data: documents } = await supabase
+    .from('documents')
+    .select('id, title, client, due_date, status, assignees(name)')
+    .order('due_date', { ascending: true })
+
+  return (
+    <main className="max-w-3xl mx-auto p-8">
+      <div className="flex justify-between items-center mb-4">
+        <h1 className="text-2xl font-bold">Document management</h1>
+        <div className="flex gap-2">
+          <Link href="/new" className="bg-blue-600 text-white px-3 py-1 rounded">New document</Link>
+          <form action={logout}><button className="border px-3 py-1 rounded">Log out</button></form>
+        </div>
+      </div>
+      <table className="w-full border-collapse">
+        <thead>
+          <tr className="border-b text-left">
+            <th className="py-2">Title</th><th>Client</th><th>Due date</th>
+            <th>Assignee</th><th>Status</th><th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {documents?.map((d) => (
+            <tr key={d.id} className="border-b">
+              <td className="py-2">{d.title}</td>
+              <td>{d.client}</td>
+              <td>{d.due_date}</td>
+              <td>{d.assignees?.name}</td>
+              <td>{d.status}</td>
+              <td className="flex gap-3 py-2">
+                <Link href={`/documents/${d.id}/edit`} className="text-blue-600">Edit</Link>
+                <form action={deleteDocument}>
+                  <input type="hidden" name="id" value={d.id} />
+                  <button className="text-red-600">Delete</button>
+                </form>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </main>
+  )
+}
+```
+It's a Server Component, so the query runs on the server. `assignees` is an object (many-to-one) → `d.assignees?.name`. Delete and Log out are `<form>`s that call the Server Actions.
+
+## Step 8 — New document page
+
+`app/new/page.tsx`:
+```tsx
+import { createDocument } from '../actions'
+import Link from 'next/link'
+
+export default function NewDocument() {
+  return (
+    <main className="max-w-md mx-auto p-8">
+      <Link href="/" className="text-blue-600">← Back</Link>
+      <h1 className="text-xl font-bold my-4">New document</h1>
+      <form action={createDocument} className="space-y-3">
+        <input name="title" placeholder="Title" required className="border p-2 w-full" />
+        <input name="client" placeholder="Client" className="border p-2 w-full" />
+        <input name="due_date" type="date" required className="border p-2 w-full" />
+        <input name="assignee_id" type="number" placeholder="Assignee ID" className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded">Save</button>
+      </form>
+    </main>
+  )
+}
+```
+
+## Step 9 — Edit document page
+
+`app/documents/[id]/edit/page.tsx` loads the document and pre-fills the form:
+```tsx
+import { createClient } from '@/lib/supabase/server'
+import { updateDocument } from '@/app/actions'
+import { notFound } from 'next/navigation'
+import Link from 'next/link'
+
+export default async function EditDocument({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params
+  const supabase = await createClient()
+  const { data: doc } = await supabase
+    .from('documents')
+    .select('id, title, client, due_date, status, assignee_id')
+    .eq('id', Number(id))
+    .single()
+
+  if (!doc) notFound()
+
+  return (
+    <main className="max-w-md mx-auto p-8">
+      <Link href="/" className="text-blue-600">← Back</Link>
+      <h1 className="text-xl font-bold my-4">Edit document</h1>
+      <form action={updateDocument} className="space-y-3">
+        <input type="hidden" name="id" value={doc.id} />
+        <input name="title" defaultValue={doc.title} required className="border p-2 w-full" />
+        <input name="client" defaultValue={doc.client ?? ''} className="border p-2 w-full" />
+        <input name="due_date" type="date" defaultValue={doc.due_date} required className="border p-2 w-full" />
+        <select name="status" defaultValue={doc.status} className="border p-2 w-full">
+          <option value="pending">pending</option>
+          <option value="in_progress">in_progress</option>
+          <option value="completed">completed</option>
+        </select>
+        <input name="assignee_id" type="number" defaultValue={doc.assignee_id ?? ''} className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded">Update</button>
+      </form>
+    </main>
+  )
+}
+```
+In Next 15 `params` is a Promise, hence `await params`. `defaultValue` pre-fills each field; the `id` travels in a hidden input so `updateDocument` knows which row to update.
+
+## Step 10 — Authentication (real login)
+
+**a) Enable Email auth.** Supabase → **Authentication → Providers → Email** (enabled). Under **Authentication → Users → Add user** create a test user (email + password).
+
+**b) Middleware to refresh the session.** `lib/supabase/middleware.ts`:
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function updateSession(request: NextRequest) {
+  let response = NextResponse.next({ request })
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() { return request.cookies.getAll() },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
+          response = NextResponse.next({ request })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options))
+        },
+      },
+    }
+  )
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user && !request.nextUrl.pathname.startsWith('/login')) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/login'
+    return NextResponse.redirect(url)
+  }
+  return response
+}
+```
+`proxy.ts` (project root):
+```ts
+import { type NextRequest } from 'next/server'
+import { updateSession } from '@/lib/supabase/middleware'
+
+export async function proxy(request: NextRequest) {
+  return await updateSession(request)
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)'],
+}
+```
+The proxy refreshes the token on every request (Server Components can't write cookies) and redirects to `/login` if there's no session.
+
+> **Next.js 16:** the `middleware.ts` file was deprecated and renamed to `proxy.ts` (and the `middleware` function → `proxy`). It's just a rename; same behavior. Important: a `middleware.ts` left un-renamed is silently ignored, so route protection would stop working. Migrate with `npx @next/codemod@latest middleware-to-proxy .`. The helper `lib/supabase/middleware.ts` can keep its name (it's not a convention file).
+
+**c) Login page.** `app/login/page.tsx`:
+```tsx
+'use client'
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { useState } from 'react'
+
+export default function Login() {
+  const supabase = createClient()
+  const router = useRouter()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState('')
+
+  async function handleLogin(e: React.FormEvent) {
+    e.preventDefault()
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+    if (error) { setError(error.message); return }
+    router.push('/')
+    router.refresh()
+  }
+
+  return (
+    <main className="max-w-sm mx-auto p-8">
+      <h1 className="text-xl font-bold mb-4">Log in</h1>
+      <form onSubmit={handleLogin} className="space-y-3">
+        {error && <p className="text-red-500 text-sm">{error}</p>}
+        <input type="email" value={email} onChange={e => setEmail(e.target.value)}
+          placeholder="Email" required className="border p-2 w-full" />
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)}
+          placeholder="Password" required className="border p-2 w-full" />
+        <button className="bg-blue-600 text-white px-4 py-2 rounded w-full">Log in</button>
+      </form>
+    </main>
+  )
+}
+```
+
+**d) Tighten RLS.** Now that there is login, replace the dev policies. For a shared internal tool (all employees see all documents):
+```sql
+drop policy "dev_all_docs" on documents;
+drop policy "dev_all_resp" on assignees;
+create policy "auth_all_docs" on documents for all
+  using (auth.uid() is not null) with check (auth.uid() is not null);
+create policy "auth_all_resp" on assignees for all
+  using (auth.uid() is not null) with check (auth.uid() is not null);
+```
+> If you want each user to see only their own rows: add a column `owner_id uuid default auth.uid()` and use `using (auth.uid() = owner_id)`.
+
+## Step 11 — Navigation map (how it all links)
+
+- `/` (`app/page.tsx`): the list. Links to `/new` and `/documents/[id]/edit`; Delete and Log out are `<form>`s → Server Actions. With no session, the middleware redirects to `/login`.
+- `/new` (`app/new/page.tsx`): form → `createDocument` → back to `/`.
+- `/documents/[id]/edit`: pre-filled form → `updateDocument` → back to `/`.
+- `/login` (`app/login/page.tsx`): `signInWithPassword` → `/`. Log out (`logout`) brings you back here.
+- All mutations live in `app/actions.ts`.
+
+```
+app/
+├── actions.ts          # Server Actions (create/update/delete/logout)
+├── page.tsx            # list + navigation (protected)
+├── login/page.tsx      # login
+├── new/page.tsx        # create
+└── documents/[id]/edit/page.tsx   # edit
+lib/supabase/{client,server,middleware}.ts
+middleware.ts
+```
+
+## Step 12 — Deploy to Vercel
+1. Push the project to GitHub (`git init`, commit, push).
+2. vercel.com → **Add New → Project** → import the repo.
+3. **Environment Variables**: paste `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`.
+4. **Deploy** → in ~1 min you get `https://...vercel.app` accessible from Japan and Vietnam.
+
+Every `git push` redeploys automatically.
+
+## Step 13 — Test → production flow
+
+Vercel provides this flow by default, on top of git branches:
+
+- **Preview (test):** every `push` to a non-`main` branch, or every Pull Request, generates a deployment with its **own unique URL**. That is your test environment.
+- **Production:** only a `push`/merge to `main` updates the production URL. Nothing reaches production without going through it.
+
+Typical flow:
+```bash
+git checkout -b feature/new-screen
+# ...changes...
+git push origin feature/new-screen   # → Vercel creates a Preview automatically
+# review on the preview URL; if OK:
+git checkout main
+git merge feature/new-screen
+git push origin main                  # → updates PRODUCTION
+```
+With a Pull Request (recommended in a team): open PR → Vercel comments the preview link → review → merge to `main` → production.
+
+**Per-environment variables (key).** In Vercel → **Settings → Environment Variables** each variable is assigned to **Production**, **Preview**, and/or **Development** separately. Recommended: **two Supabase projects** (one test, one production); Preview variables point to the test DB and Production variables to the real one. This lets you test without touching real data.
+
+Notes:
+- The Hobby (free) plan already includes unlimited previews.
+- You can protect previews with login so they aren't public.
+- For automated tests before deploy, it integrates with GitHub Actions.
+
+## Step 14 — Migrations and environments (schema as code)
+
+The idea that avoids copy-pasting: the schema lives as **migration files** in your repo; each environment is rebuilt from them. You never copy production data; preview data is seed data.
+
+Initialize Supabase and capture the current schema as a migration:
+```bash
+npx supabase init
+npx supabase login
+npx supabase link --project-ref <PROD-ref>
+npx supabase db pull          # creates supabase/migrations/<ts>_remote_schema.sql
+```
+Commit that file. For each future change:
+```bash
+npx supabase migration new add_something
+# write the change's SQL in the generated file
+```
+
+### Option B — two synced projects (free)
+
+1. Create a second Supabase project (e.g. `staging`) in Tokyo; note its URL and anon key.
+2. Apply the migrations to each environment by re-linking:
+```bash
+# staging
+npx supabase link --project-ref <STAGING-ref>
+npx supabase db push
+# production (after validating on staging)
+npx supabase link --project-ref <PROD-ref>
+npx supabase db push
+```
+3. Test data on staging only: sample INSERTs in `supabase/seed.sql` (or in its SQL Editor). Production stays untouched.
+4. In Vercel → **Settings → Environment Variables**, assign per environment:
+   - **Production** → production URL + anon key.
+   - **Preview** (and Development) → staging URL + anon key.
+
+Result: preview deployments use the staging DB; production uses the real one. You sync the **schema** (migrations), never the data.
+
+> Security: never commit the DB password or connection strings.
+> Automated alternative: **Supabase Branching** does this automatically per PR (isolated preview + Vercel variables), but requires a paid plan (~$0.013/branch/hour).
+
+## Step 15 — Responsive UI, search, filters and pagination
+
+**a) Shared style tokens.** `lib/ui.tsx` centralizes the Tailwind classes used everywhere (inputs, buttons, labels, links) plus a `StatusBadge` component, so `/`, `/new`, `/documents/[id]/edit` and `/login` look consistent instead of each page hand-rolling its own classes:
+```tsx
+export const inputClass =
+  'w-full rounded-md border border-gray-300 bg-white px-3 py-2 text-sm text-gray-900 placeholder:text-gray-400 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 dark:border-gray-700 dark:bg-gray-950 dark:text-gray-100'
+
+const STATUS_STYLES: Record<string, string> = {
+  pending: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  in_progress: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
+  completed: 'bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300',
+}
+
+export function StatusBadge({ status }: { status: string }) {
+  const style = STATUS_STYLES[status] ?? 'bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300'
+  return <span className={`inline-flex rounded-full px-2.5 py-0.5 text-xs font-medium ${style}`}>{status.replace('_', ' ')}</span>
+}
+```
+
+**b) Responsive table.** Instead of a separate mobile "card" layout (more code, two render paths to keep in sync), secondary columns collapse by breakpoint:
+```tsx
+<th className="hidden px-4 py-3 sm:table-cell">Client</th>
+<th className="hidden px-4 py-3 md:table-cell">Assignee</th>
+```
+Title, due date, status and actions stay visible at every width; the table also sits in an `overflow-x-auto` wrapper as a safety net for very narrow viewports.
+
+**c) Search and filter — no client component needed.** A plain GET `<form>` submits straight to `/?q=...&status=...`; the browser does the navigation, no `onChange`/`useState`/debounce required:
+```tsx
+<form action="/" className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+  <input name="q" defaultValue={q} placeholder="Title or client…" className={inputClass} />
+  <select name="status" defaultValue={status} className={inputClass}>
+    <option value="">All statuses</option>
+    {STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+  </select>
+  <button className={buttonPrimaryClass}>Filter</button>
+</form>
+```
+`Home` reads `q`/`status`/`page` from `searchParams` (a `Promise` in the App Router) and builds the query:
+```ts
+const { q = '', status = '', page: pageParam } = await searchParams
+const page = Math.max(1, Number(pageParam) || 1)
+
+let query = supabase
+  .from('documents')
+  .select('id, title, client, due_date, status, assignees(name)', { count: 'exact' })
+  .order('due_date', { ascending: true })
+
+// Strip characters with special meaning in PostgREST's or() syntax
+// (comma separates conditions, parens group them) so a search term
+// can't break the filter.
+const safeQ = q.replace(/[,()]/g, '').trim()
+if (safeQ) query = query.or(`title.ilike.%${safeQ}%,client.ilike.%${safeQ}%`)
+if (status) query = query.eq('status', status)
+```
+
+**d) Pagination.** `{ count: 'exact' }` on the `select` plus `.range(from, to)` returns both the page of rows and the total count in a single request:
+```ts
+const PAGE_SIZE = 10
+const from = (page - 1) * PAGE_SIZE
+const { data: documents, count, error } = await query.range(from, from + PAGE_SIZE - 1)
+const totalPages = Math.max(1, Math.ceil((count ?? 0) / PAGE_SIZE))
+```
+`Previous`/`Next` are plain `<Link>`s built by a small helper that carries `q` and `status` forward and only adds `page` to the URL when it isn't 1 (so page 1 stays a clean `/`):
+```ts
+function pageHref({ q, status, page }: { q: string; status: string; page: number }) {
+  const sp = new URLSearchParams()
+  if (q) sp.set('q', q)
+  if (status) sp.set('status', status)
+  if (page > 1) sp.set('page', String(page))
+  const qs = sp.toString()
+  return qs ? `/?${qs}` : '/'
+}
+```
+
+> Why no Client Component: search, filter and paging are all expressible as a GET form and links — the same server-first approach as the rest of the app. No `useState`, no debounce, and it keeps working with JavaScript disabled. `q`/`status`/`page` living in the URL also makes the current view bookmarkable and shareable.
+
+---
+
+**Summary:** Supabase = ready-made backend (DB + API + auth); Vercel = global front end + test→prod flow on git. You only write pages and queries. That's why it's the fastest and cheapest option compared to running a VM.
