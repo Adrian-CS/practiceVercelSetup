@@ -661,6 +661,38 @@ if (defaultQ !== prevDefaultQ) {
 
 > Net effect: three of four pieces (delete confirmation, cursor, and the wider search predicate) needed no new client-side state at all. Only "search as you type" genuinely requires a Client Component — everything else stays server-first.
 
+## Step 17 — Loading states for the slow spots
+
+`/` and `/documents/[id]/edit` both await a Supabase query before they can render anything (the list + count + assignee lookup on one, a `.single()` row fetch on the other) — so navigating in or out of them has a real gap where nothing happens on screen yet. That network round trip can't be removed, but the *perceived* wait can: the App Router's `loading.tsx` file convention wraps a route segment in a `<Suspense>` boundary automatically, so Next.js shows that file immediately on navigation and swaps in the real page the moment the data resolves. No client state, no manual spinner wiring — just naming the file correctly:
+
+```tsx
+// app/loading.tsx — shown while Home's Supabase query is in flight
+export default function Loading() {
+  return (
+    <main className="mx-auto max-w-5xl animate-pulse p-4 sm:p-8">
+      <div className="h-8 w-56 rounded bg-gray-200 dark:bg-gray-800" />
+      {/* ...skeleton bars shaped like the toolbar and table rows... */}
+    </main>
+  )
+}
+```
+```tsx
+// app/documents/[id]/edit/loading.tsx — shown while the row fetch is in flight
+export default function Loading() {
+  return (
+    <main className="mx-auto max-w-md animate-pulse p-4 sm:p-8">
+      {Array.from({ length: 5 }).map((_, i) => (
+        <div key={i} className="mb-4 h-10 rounded-md bg-gray-200 dark:bg-gray-800" />
+      ))}
+    </main>
+  )
+}
+```
+
+Each skeleton is sized to match its real page (same max-width, same number of rows/fields) so the content doesn't jump once it swaps in. `/new` and `/login` don't get one — they're already static (prerendered at build time), so there's no data-fetching gap for a `loading.tsx` to cover.
+
+> Note: this only smooths *route-to-route* navigation (clicking a `<Link>` between `/`, `/new`, `/documents/[id]/edit`). The live search in Step 16 already handles its own in-place loading via `Filters`' `isPending` + "Searching…" indicator, wrapped in `useTransition` specifically so it *doesn't* re-trigger this route-level fallback on every keystroke.
+
 ---
 
 **Summary:** Supabase = ready-made backend (DB + API + auth); Vercel = global front end + test→prod flow on git. You only write pages and queries. That's why it's the fastest and cheapest option compared to running a VM.

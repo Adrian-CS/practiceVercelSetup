@@ -661,6 +661,38 @@ if (defaultQ !== prevDefaultQ) {
 
 > 結果:4つの変更のうち3つ(削除確認・カーソル・検索対象の拡大)はクライアント側の state を一切必要としなかった。「入力しながら検索」だけが本当にクライアントコンポーネントを要求する — それ以外はサーバーファーストのまま。
 
+## ステップ17 — 遅く感じる箇所にローディング状態を出す
+
+`/` と `/documents/[id]/edit` はどちらも、何かを描画する前に Supabase のクエリを待つ(前者は一覧+件数+担当者検索、後者は `.single()` での1行取得)。そのため、これらのページに出入りする際、画面に何も起きていないように見える本当の「間」がある。このネットワーク往復そのものはなくせないが、*体感の*待ち時間はなくせる:App Router の `loading.tsx` というファイル規約は、ルートセグメントを自動的に `<Suspense>` 境界で包む。Next.js はナビゲーション直後にこのファイルを表示し、データが解決した瞬間に本物のページへ差し替える。クライアント側の state もスピナーの手配線も不要 — ファイルを正しく命名するだけ:
+
+```tsx
+// app/loading.tsx — Home の Supabase クエリが実行中に表示される
+export default function Loading() {
+  return (
+    <main className="mx-auto max-w-5xl animate-pulse p-4 sm:p-8">
+      <div className="h-8 w-56 rounded bg-gray-200 dark:bg-gray-800" />
+      {/* …ツールバーとテーブル行の形をしたスケルトンバー… */}
+    </main>
+  )
+}
+```
+```tsx
+// app/documents/[id]/edit/loading.tsx — 行の取得中に表示される
+export default function Loading() {
+  return (
+    <main className="mx-auto max-w-md animate-pulse p-4 sm:p-8">
+      {Array.from({ length: 5 }).map((_, i) => (
+        <div key={i} className="mb-4 h-10 rounded-md bg-gray-200 dark:bg-gray-800" />
+      ))}
+    </main>
+  )
+}
+```
+
+各スケルトンは実際のページに合わせたサイズ(同じ max-width、同じ行数・項目数)にしてあるので、本物のコンテンツに差し替わってもガタつかない。`/new` と `/login` には用意していない — どちらもビルド時に静的にプリレンダーされ済みで、`loading.tsx` がカバーすべきデータ取得の「間」がそもそも無いため。
+
+> 補足:これが滑らかにするのは *ルート間の* ナビゲーション(`/`・`/new`・`/documents/[id]/edit` 間の `<Link>` クリック)だけ。ステップ16 のリアルタイム検索は、`Filters` の `isPending` + 「Searching…」表示という自前のその場ローディングを既に持っており、`useTransition` で包んでいるのはまさに、1文字入力するたびにこのルートレベルの fallback が出ないようにするため。
+
 ---
 
 **まとめ:** Supabase = 出来合いのバックエンド(DB + API + 認証)、Vercel = グローバルなフロント + git ベースのテスト→本番フロー。自分はページとクエリを書くだけ。VM を自前で運用する方式に比べ、最速・最安である理由がこれ。
