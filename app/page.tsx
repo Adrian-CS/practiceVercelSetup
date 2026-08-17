@@ -1,10 +1,10 @@
 import { createClient } from '@/lib/supabase/server'
-import { deleteDocument, logout } from './actions'
+import { deleteDocument } from './actions'
 import { DeleteButton } from './DeleteButton'
 import { DocumentRow } from './DocumentRow'
 import { Filters } from './Filters'
 import Link from 'next/link'
-import { buttonPrimaryClass, buttonSecondaryClass, linkClass, StatusBadge } from '@/lib/ui'
+import { buttonSecondaryClass, linkClass, StatusBadge } from '@/lib/ui'
 
 const PAGE_SIZE = 10
 
@@ -124,15 +124,7 @@ export default async function Home({
 
   return (
     <main className="mx-auto max-w-5xl p-4 sm:p-8">
-      <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-bold">Document management</h1>
-        <div className="flex gap-2">
-          <Link href="/new" className={buttonPrimaryClass}>New document</Link>
-          <form action={logout}>
-            <button className={buttonSecondaryClass}>Log out</button>
-          </form>
-        </div>
-      </div>
+      <h1 className="mb-6 text-2xl font-bold">Documents</h1>
 
       <Filters defaultQ={q} defaultStatus={status} />
 

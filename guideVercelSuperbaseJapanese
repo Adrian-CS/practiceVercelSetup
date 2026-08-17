@@ -689,7 +689,7 @@ export default function Loading() {
 }
 ```
 
-各スケルトンは実際のページに合わせたサイズ(同じ max-width、同じ行数・項目数)にしてあるので、本物のコンテンツに差し替わってもガタつかない。`/new` と `/login` には用意していない — どちらもビルド時に静的にプリレンダーされ済みで、`loading.tsx` がカバーすべきデータ取得の「間」がそもそも無いため。
+各スケルトンは実際のページに合わせたサイズ(同じ max-width、同じ行数・項目数)にしてあるので、本物のコンテンツに差し替わってもガタつかない。この時点では `/new` と `/login` はまだ静的(ビルド時にプリレンダー済み)だったので、`loading.tsx` がカバーすべきデータ取得の「間」はそもそも無かった — ステップ19 でこれが変わる。
 
 > 補足:これが滑らかにするのは *ルート間の* ナビゲーション(`/`・`/new`・`/documents/[id]/edit` 間の `<Link>` クリック)だけ。ステップ16 のリアルタイム検索は、`Filters` の `isPending` + 「Searching…」表示という自前のその場ローディングを既に持っており、`useTransition` で包んでいるのはまさに、1文字入力するたびにこのルートレベルの fallback が出ないようにするため。
 
@@ -754,6 +754,63 @@ export function DocumentRow({ href, className, children }: { href: string; class
 `closest('a, button')` によるガードが重要:これが無いと、行の中にある **Edit** リンクや **Delete** ボタンをダブルクリックしたときにも行の遷移が発火してしまう — Edit なら行き先が同じなので実害は無いが、Delete の場合は `confirm()` ダイアログと余計なナビゲーションが競合する可能性があり、避けておく価値がある。
 
 > ステップ16 と同じパターン:クライアントコンポーネントに頼るのは、`dblclick` やキー入力のように本質的にブラウザのイベントである部分だけ — ソートやページネーションはサーバーレンダリングのリンクのまま。
+
+## ステップ19 — 常設のナビバーとフッター
+
+**a) 共通のUI部品をルートレイアウトへ移す。** `Home` は独自のヘッダー(アプリ名・「New document」・「Log out」)を持っていた — 同じリンクを必要とする各ページで重複し、`/new`/`/documents/[id]/edit` には無い(そこからログアウトする方法が無い)という問題があった。`app/layout.tsx` に移すことで両方解決する:1回書けば、どのページでも自動的に表示される。
+
+`app/Navbar.tsx` は Server Component — `logout` はここでも普通の `<form action={logout}>` の Server Action なので、クライアント JS は不要:
+```tsx
+import Link from 'next/link'
+import { logout } from './actions'
+import { buttonSecondaryClass, linkClass } from '@/lib/ui'
+
+export function Navbar({ userEmail }: { userEmail?: string }) {
+  return (
+    <header className="border-b border-gray-200 dark:border-gray-800">
+      <div className="mx-auto flex max-w-5xl flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+        <Link href="/" className="text-lg font-bold">📄 Document management</Link>
+        {userEmail && (
+          <nav className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <Link href="/" className={linkClass}>Home</Link>
+            <Link href="/new" className={linkClass}>New document</Link>
+            <span className="text-gray-500 dark:text-gray-400">{userEmail}</span>
+            <form action={logout}><button className={buttonSecondaryClass}>Log out</button></form>
+          </nav>
+        )}
+      </div>
+    </header>
+  )
+}
+```
+`userEmail` があるかどうかで、認証済み専用のリンクを表示するか決める — `/login` にはユーザーがいないので、ナビバーは静かにブランドリンクだけにフォールバックする。`app/Footer.tsx` はさらに単純:props もロジックも無い、ただの静的な `<footer>`。
+
+**b) レイアウトへの組み込み — そしてそれに伴うトレードオフ。** ルートレイアウトはログイン中のユーザーがいるかどうかを知る必要が出てくるため、`async` になり Supabase を直接呼ぶ:
+```tsx
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  return (
+    <html lang="en" ...>
+      <body className="flex min-h-full flex-col" suppressHydrationWarning>
+        <Navbar userEmail={user?.email} />
+        <div className="flex-1">{children}</div>
+        <Footer />
+      </body>
+    </html>
+  )
+}
+```
+`createClient()` は cookie を読む。cookie を読むことは *Dynamic API* の使用にあたり、レイアウトのどこかで1つでも使うと、その配下の全ページが静的レンダリングの対象から外れる。この変更前は `/new` と `/login` はビルド時にプリレンダーされていた(ビルド出力で `○`)。変更後は、ルートレイアウトが全ページを包んでいるせいで、アプリ全体がリクエストごとのサーバーレンダリング(`ƒ`)になる。これは仮説ではなく、変更の前後で `next build` を実際に走らせて確認した、本物の・測定可能なトレードオフ。
+
+修正はステップ17 と同じ発想:新たに動的になった2つのルートにも `loading.tsx` を用意し、「クリックしても何も起きない」感覚が逆戻りしないようにする:
+```
+app/new/loading.tsx     — 4つの入力欄プレースホルダー + ボタン部分
+app/login/loading.tsx   — ログインカード自体のスケルトン。中央寄せの仕方も同じ
+```
+
+> 採らなかった代替案:ユーザー情報をクライアント側で取得する(クライアントコンポーネントで `useEffect` を使う)方法なら `/new` と `/login` を静的なままにできるが、クライアント側のチェックが終わるまでナビバーに一瞬「ログアウト状態」が出るチラつきと、そのためのクライアント JS が代償になる。すべてのルートがどのみち認証のために middleware の往復コストを払っている社内ツールにおいては、レイアウトでのリクエストごとの `getUser()` 呼び出しという小さくて正直なコストの方を選び、ナビバーはサーバーレンダリングのままチラつき無しにしておく。
 
 ---
 

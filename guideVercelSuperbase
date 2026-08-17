@@ -689,7 +689,7 @@ export default function Loading() {
 }
 ```
 
-Each skeleton is sized to match its real page (same max-width, same number of rows/fields) so the content doesn't jump once it swaps in. `/new` and `/login` don't get one — they're already static (prerendered at build time), so there's no data-fetching gap for a `loading.tsx` to cover.
+Each skeleton is sized to match its real page (same max-width, same number of rows/fields) so the content doesn't jump once it swaps in. At this point `/new` and `/login` were still static (prerendered at build time), so there was no data-fetching gap for a `loading.tsx` to cover there — Step 19 changes that.
 
 > Note: this only smooths *route-to-route* navigation (clicking a `<Link>` between `/`, `/new`, `/documents/[id]/edit`). The live search in Step 16 already handles its own in-place loading via `Filters`' `isPending` + "Searching…" indicator, wrapped in `useTransition` specifically so it *doesn't* re-trigger this route-level fallback on every keystroke.
 
@@ -754,6 +754,63 @@ export function DocumentRow({ href, className, children }: { href: string; class
 The `closest('a, button')` guard matters: without it, double-clicking the row's own **Edit** link or **Delete** button would *also* fire the row's navigation — harmless for Edit (same destination), but worth avoiding for Delete, where a stray navigation racing the `confirm()` dialog is just needless complexity.
 
 > Same pattern as Step 16: reach for a Client Component only for the one interaction that's inherently a browser event (`dblclick`, keystrokes) — sorting and pagination stay server-rendered links.
+
+## Step 19 — A persistent navbar and footer
+
+**a) Move global chrome into the root layout.** `Home` had its own header with the app title, "New document" and "Log out" — duplicated on every page that needed the same links, and missing on `/new`/`/documents/[id]/edit` (no way to log out from there). Moving it into `app/layout.tsx` fixes both: it renders once, on every page, automatically.
+
+`app/Navbar.tsx` is a Server Component — `logout` is still a plain `<form action={logout}>` Server Action, so no client JS is needed here either:
+```tsx
+import Link from 'next/link'
+import { logout } from './actions'
+import { buttonSecondaryClass, linkClass } from '@/lib/ui'
+
+export function Navbar({ userEmail }: { userEmail?: string }) {
+  return (
+    <header className="border-b border-gray-200 dark:border-gray-800">
+      <div className="mx-auto flex max-w-5xl flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
+        <Link href="/" className="text-lg font-bold">📄 Document management</Link>
+        {userEmail && (
+          <nav className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+            <Link href="/" className={linkClass}>Home</Link>
+            <Link href="/new" className={linkClass}>New document</Link>
+            <span className="text-gray-500 dark:text-gray-400">{userEmail}</span>
+            <form action={logout}><button className={buttonSecondaryClass}>Log out</button></form>
+          </nav>
+        )}
+      </div>
+    </header>
+  )
+}
+```
+`userEmail` being present is what decides whether the authenticated links show at all — on `/login` there's no user, so the navbar quietly falls back to just the brand link. `app/Footer.tsx` is even simpler: a static `<footer>`, no props, no logic.
+
+**b) Wiring it into the layout — and the trade-off that comes with it.** The root layout now has to know if there's a logged-in user, so it becomes `async` and calls Supabase directly:
+```tsx
+export default async function RootLayout({ children }: LayoutProps<"/">) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+
+  return (
+    <html lang="en" ...>
+      <body className="flex min-h-full flex-col" suppressHydrationWarning>
+        <Navbar userEmail={user?.email} />
+        <div className="flex-1">{children}</div>
+        <Footer />
+      </body>
+    </html>
+  )
+}
+```
+`createClient()` reads cookies, and reading cookies is a *Dynamic API* — using one anywhere in a layout opts every page under it out of static rendering. Before this change, `/new` and `/login` were prerendered at build time (`○` in the build output); after it, the whole app is server-rendered per request (`ƒ`), because the root layout wraps everything. That's a real, measurable trade-off, not a hypothetical one — confirmed by re-running `next build` before and after.
+
+The fix is the one from Step 17: give the two newly-dynamic routes their own `loading.tsx` too, so the regression doesn't reintroduce the "nothing happens on click" feeling:
+```
+app/new/loading.tsx     — 4 field placeholders + a button bar
+app/login/loading.tsx   — the login card's own skeleton, centered the same way
+```
+
+> Alternative not taken: fetching the user client-side (in a Client Component, via `useEffect`) would let `/new` and `/login` stay static, at the cost of a brief "logged out" flash in the navbar before the client-side check resolves, plus the client JS to do it. For an internal tool where every route already pays a middleware round trip for auth anyway, the extra per-request `getUser()` call in the layout is a small, honest cost — and it keeps the navbar server-rendered and flash-free.
 
 ---
 
