@@ -6,7 +6,7 @@ import { buttonSecondaryClass, linkClass } from '@/lib/ui'
 // Action like everywhere else in the app.
 export function Navbar({ userEmail }: { userEmail?: string }) {
   return (
-    <header className="border-b border-gray-200 dark:border-gray-800">
+    <header className="border-b border-gray-200 bg-gray-50 dark:border-gray-800 dark:bg-gray-900">
       <div className="mx-auto flex max-w-5xl flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-8">
         <Link href="/" className="text-lg font-bold">
           📄 Document management
