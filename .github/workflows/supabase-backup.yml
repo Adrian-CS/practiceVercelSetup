@@ -1,0 +1,30 @@
+name: Supabase Backup
+
+on:
+  schedule:
+    - cron: '0 18 * * *'      # cada día a las 18:00 UTC (03:00 JST)
+  workflow_dispatch:           # botón para lanzarlo a mano cuando quieras
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Instalar cliente de PostgreSQL 16
+        run: |
+          sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+
+      - name: Hacer el dump
+        run: |
+          pg_dump "$SUPABASE_DB_URL" --no-owner --no-privileges -F c -f backup.dump
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+
+      - name: Guardar el backup como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ github.run_id }}
+          path: backup.dump
+          retention-days: 30

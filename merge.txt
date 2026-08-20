@@ -1,0 +1,4 @@
+git checkout developing
+git merge main        # fast-forward automático, developing pasa a apuntar donde main
+git push origin developing
+git checkout main     # vuelves a main
