@@ -16,15 +16,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
 
-  name: Hacer el dump
-  run: |
-    /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL" \
-      --no-owner \
-      --no-privileges \
-      -F c \
-      -f backup.dump
-  env:
-    SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      - name: Hacer el dump
+        run: |
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL" \
+          --no-owner \
+          --no-privileges \
+          -F c \
+          -f backup.dump
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
 
       - name: Guardar el backup como artefacto
         uses: actions/upload-artifact@v4
